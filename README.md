@@ -1,26 +1,67 @@
 # Cleanfi
 
-Production-oriented Telegram audiobook metadata cleaner.
+Production-oriented Telegram audiobook metadata cleaner/repacker.
+
+## Current workflow
+
+1. Set the source and target channels with `/source @channel` and `/target @channel`.
+2. Create a job with `/range START END`.
+3. Configure Artist, Genre, Year, Album, Album Artist, Comment and Cover for that job.
+4. Press **START** or use `/startjob JOB_ID`.
+5. Cleanfi downloads each audio, removes old metadata, preserves the original title, writes the requested metadata, embeds artwork where supported, and uploads the result to the target channel.
+
+Every job stores its own source/target and metadata profile, so different ranges can safely use different settings.
 
 ## Features
 
-- Per-job metadata profiles: each range can have different Artist, Genre, Year, Album, Album Artist and Comment.
-- Original title is preserved by default.
-- Cleans existing tags before writing the configured values.
+- Telegram-visible Artist/Performer and Title are explicitly supplied during upload.
+- Original title is preserved exactly as Unicode text, including Hindi/Devanagari, unless a future title editor is added.
+- MP3 ID3 uses UTF-8 Unicode frames and ID3v2.4 to avoid Hindi/Unicode mojibake.
+- Existing tags are cleared before writing configured metadata.
+- Artist, Genre, Year, Album, Album Artist and Comment support.
+- Cover is embedded in supported containers and also sent as Telegram thumbnail.
 - MP3, M4A/MP4, FLAC, OGG, Opus, WAV/AIFF and WMA handling through Mutagen where supported.
-- Cover upload per job for formats that support embedded artwork.
-- Range processing is inclusive.
-- FloodWait-aware download/upload loops.
-- Job persistence in `jobs.json`.
+- Raw AAC/ADTS is never silently transcoded or corrupted when its container cannot safely carry metadata.
+- Inclusive message ranges.
+- Queue/worker processing with configurable workers.
+- Live progress bar with processed/failed/skipped counts, speed, elapsed time and ETA.
+- FloodWait-aware Telegram operations: the bot waits for Telegram's requested duration and resumes instead of crashing.
+- Atomic persistent job state and startup recovery to paused state; already processed/skipped IDs are not repeated on resume/retry.
+- Failed-file list and retry support.
 - Admin-only private control surface.
-- Inline metadata controls plus command interface.
-- `/test`, `/status`, `/cancel`, `/retry`, `/failed` and `/jobs`.
+- Structured inline menu plus command interface.
+- Temporary files are removed after each item.
+
+## Commands
+
+```text
+/start
+/help
+/source @channelusername
+/target @channelusername
+/range 1250 1300
+/meta artist="Artist A" genre="Romance" year=2026 album="Book A"
+/cover JOB_ID
+/startjob JOB_ID
+/status JOB_ID
+/cancel JOB_ID
+/retry JOB_ID
+/failed JOB_ID
+/test MESSAGE_ID
+/jobs
+```
+
+## Metadata safety
+
+Cleanfi never transliterates, ASCII-normalizes, or manually re-encodes the title. The original title is read from the source container and passed through unchanged. For MP3, ID3v2.4 UTF-8 frames are used. Telegram's `send_audio` upload also receives the title and performer explicitly, so the visible Telegram Artist/Author field does not depend only on the embedded tags. citeturn2search0
+
+Audio streams are copied without re-encoding. Metadata changes therefore do not intentionally reduce audio quality.
 
 ## Important format note
 
-Raw AAC/ADTS does not provide a portable container for arbitrary embedded cover/tag data. Cleanfi intentionally does not transcode it silently. It will preserve the audio bytes rather than claim unsupported metadata was written.
+Raw AAC/ADTS does not provide a portable container for arbitrary embedded cover/tag data. Cleanfi preserves the audio bytes rather than silently changing the container.
 
-WAV/AIFF/WMA metadata capabilities depend on the exact container/tag implementation. The bot reports processing failures instead of pretending an unsupported tag was embedded.
+WAV/AIFF/WMA metadata capabilities depend on the exact container/player implementation. Failures are recorded instead of pretending unsupported metadata was written.
 
 ## VPS setup
 
@@ -41,7 +82,7 @@ sudo chmod 600 .env
 sudo nano .env
 ```
 
-Set API_ID, API_HASH, BOT_TOKEN, SOURCE_CHAT_ID, TARGET_CHAT_ID and ADMIN_IDS.
+Set `API_ID`, `API_HASH`, `BOT_TOKEN`, `ADMIN_IDS`. `SOURCE_CHAT_ID` and `TARGET_CHAT_ID` can be used as initial defaults; the bot can also resolve and persist channels with `/source` and `/target`.
 
 Then:
 
@@ -53,28 +94,4 @@ sudo systemctl status cleanfi
 journalctl -u cleanfi -f
 ```
 
-## Usage
-
-```text
-/range 1250 1300
-```
-
-Configure with inline buttons, or:
-
-```text
-/meta artist="Artist A" genre="Romance" year=2026 album="Book A"
-```
-
-Then press **START** or:
-
-```text
-/startjob JOB_ID
-```
-
-For a cover, send the image with:
-
-```text
-/cover JOB_ID
-```
-
-The source message caption is preserved on upload. The original filename is preserved.
+The systemd service starts `bot.py`, which loads the corrected Cleanfi runtime implementation.
