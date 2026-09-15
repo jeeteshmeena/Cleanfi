@@ -15,12 +15,16 @@ ADMINS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.str
 TEMP = Path(os.getenv("TEMP_DIR", "./tmp")); TEMP.mkdir(parents=True, exist_ok=True)
 STATE = Path(os.getenv("STATE_FILE", "./jobs.json"))
 FILE_DELAY = max(3, int(os.getenv("FILE_DELAY_SECONDS", "3")))
+MAX_QUEUE = max(1, int(os.getenv("MAX_QUEUED_JOBS", "20")))
 
 app = Client("cleanfi", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 jobs, settings, sessions, running = {}, {}, {}, {}
 state_lock = asyncio.Lock()
 tg_lock = asyncio.Lock()
 flood_until = 0.0
+job_queue = None
+queue_task = None
+queued_jobs = set()
 
 
 def save_sync():
@@ -67,7 +71,7 @@ def newmeta():
 
 async def tg_call(fn, jid=None, label="Telegram"):
     """Single-flight Telegram call with infinite FloodWait retry.
-    A FloodWait is never converted into a failed file.
+    FloodWait is never converted into a failed file.
     """
     global flood_until
     while True:
@@ -86,7 +90,6 @@ async def tg_call(fn, jid=None, label="Telegram"):
                     jobs[jid]["flood_label"] = label
                     await save()
                 print(f"FloodWait: {label}; sleeping {seconds}s; retrying the same operation")
-        # Do not hold the Telegram lock while sleeping.
         await asyncio.sleep(seconds + 1)
 
 async def resolve_chat(value):
@@ -169,7 +172,7 @@ async def create_job(owner, start, end):
                  "processed": [], "failed": [], "failed_reasons": {}, "skipped": [], "status": "configured",
                  "cancel_requested": False, "meta": newmeta(), "source": settings["source"], "target": settings["target"],
                  "created": time.time(), "started_at": None, "progress_message_id": None, "last_progress": 0,
-                 "current": None, "flood_until": 0}
+                 "current": None, "flood_until": 0, "queue_ids": None}
     sessions[owner] = jid
     await save()
     return jid
@@ -253,7 +256,7 @@ async def status_cmd(_, m):
     if not allowed(m): return
     jid = getjid(m)
     if jid not in jobs: return await m.reply_text("Unknown job.")
-    await m.reply_text(progress_text(jid) if jobs[jid]["status"] in {"running","cancelling"} else summary(jid), reply_markup=job_kb(jid))
+    await m.reply_text(progress_text(jid) if jobs[jid]["status"] in {"running","cancelling","queued"} else summary(jid), reply_markup=job_kb(jid))
 
 @app.on_message(filters.private & filters.command("failed"))
 async def failed_cmd(_, m):
@@ -269,7 +272,13 @@ async def cancel_cmd(_, m):
     if not allowed(m): return
     jid = getjid(m)
     if jid in jobs:
-        jobs[jid]["cancel_requested"] = True; jobs[jid]["status"] = "cancelling"; await save()
+        jobs[jid]["cancel_requested"] = True
+        if jobs[jid].get("status") == "queued":
+            queued_jobs.discard(jid)
+            jobs[jid]["status"] = "cancelled"
+        else:
+            jobs[jid]["status"] = "cancelling"
+        await save()
         await m.reply_text(f"Cancellation requested: {jid}")
 
 @app.on_message(filters.private & filters.command("retry"))
@@ -315,7 +324,6 @@ async def process_file(jid, mid):
             try:
                 f = MFile(str(inp), easy=True); title = (f.get("title") or [None])[0] if f else None
             except Exception: title = None
-        # Never transliterate/encode the title. Path stem is only the last fallback.
         title = title if title is not None else Path(name).stem
         await asyncio.to_thread(clean_and_apply_metadata, str(inp), str(out), title=title,
             artist=j["meta"].get("artist"), genre=j["meta"].get("genre"), year=j["meta"].get("year"),
@@ -333,15 +341,58 @@ async def process_file(jid, mid):
             except FileNotFoundError: pass
 
 async def launch(jid, m, ids=None):
-    if jid in running: return await m.reply_text("Job is already running.")
-    running[jid] = asyncio.create_task(run_job(jid, m, ids))
-    await m.reply_text(f"Job {jid} queued. Processing sequentially with a {FILE_DELAY}s safety delay per file.")
+    global job_queue, queue_task
+    if jid in running or jid in queued_jobs:
+        return await m.reply_text(f"Job {jid} is already running or queued.")
+    if len(queued_jobs) >= MAX_QUEUE:
+        return await m.reply_text(f"Queue is full ({MAX_QUEUE} jobs). Start it after a slot is available.")
+    if jobs[jid].get("status") in {"completed", "completed_with_failures", "cancelled"} and not ids:
+        # A completed job can be started again; processed/skipped IDs remain protected from duplicates.
+        pass
+    if job_queue is None:
+        job_queue = asyncio.Queue()
+    jobs[jid]["queue_ids"] = list(ids) if ids else None
+    jobs[jid]["status"] = "queued"
+    jobs[jid]["cancel_requested"] = False
+    queued_jobs.add(jid)
+    await job_queue.put(jid)
+    if queue_task is None or queue_task.done():
+        queue_task = asyncio.create_task(queue_worker())
+    await save()
+    position = list(queued_jobs).index(jid) + 1
+    await m.reply_text(f"Job {jid} queued. Queue position: {position}\nOnly one job runs at a time; the next job starts automatically after this job ends.")
 
-async def run_job(jid, m, ids=None):
+async def queue_worker():
+    while True:
+        jid = await job_queue.get()
+        queued_jobs.discard(jid)
+        if jid not in jobs:
+            job_queue.task_done(); continue
+        if jobs[jid].get("cancel_requested"):
+            jobs[jid]["status"] = "cancelled"
+            await save(); job_queue.task_done(); continue
+        try:
+            running[jid] = True
+            await run_job(jid, jobs[jid]["queue_ids"])
+        except Exception as e:
+            j = jobs.get(jid)
+            if j:
+                j["status"] = "failed_queue"
+                j["failed_reasons"]["__job__"] = f"{type(e).__name__}: {e}"
+                await save()
+                try: await app.send_message(j["owner"], f"Job {jid} stopped unexpectedly: {type(e).__name__}: {e}")
+                except Exception: pass
+        finally:
+            running.pop(jid, None)
+            if jid in jobs and jobs[jid].get("status") == "running":
+                jobs[jid]["status"] = "completed_with_failures" if jobs[jid]["failed"] else "completed"
+            await save()
+            job_queue.task_done()
+
+async def run_job(jid, ids=None):
     j = jobs[jid]
     j["status"] = "running"; j["started_at"] = j.get("started_at") or time.time(); await save()
-    ids = ids or list(range(j["start"], j["end"]+1))
-    # Resume safety: already successful/skipped message IDs are not repeated.
+    ids = ids if ids is not None else list(range(j["start"], j["end"]+1))
     completed = set(j["processed"]) | set(j["skipped"])
     ids = [i for i in ids if i not in completed]
     await safe_progress(jid, True)
@@ -359,8 +410,6 @@ async def run_job(jid, m, ids=None):
                     if mid not in j["failed"]: j["failed"].append(mid)
                     j["failed_reasons"][str(mid)] = reason or "unknown"
             except FloodWait:
-                # Defensive guard. tg_call normally consumes every FloodWait internally.
-                # This path is intentionally NOT counted as a failure.
                 continue
             except Exception as e:
                 if mid not in j["failed"]: j["failed"].append(mid)
@@ -369,10 +418,16 @@ async def run_job(jid, m, ids=None):
                 j["current"] = None; await save(); await safe_progress(jid, True)
                 if not j.get("cancel_requested"):
                     await asyncio.sleep(FILE_DELAY)
-        j["status"] = "cancelled" if j.get("cancel_requested") else ("completed_with_failures" if j["failed"] else "completed")
+        if j.get("cancel_requested"):
+            j["status"] = "cancelled"
+        elif j["failed"]:
+            j["status"] = "completed_with_failures"
+        else:
+            j["status"] = "completed"
     finally:
-        j["current"] = None; await save(); await safe_progress(jid, True); running.pop(jid, None)
-        await m.reply_text(summary(jid))
+        j["current"] = None; await save(); await safe_progress(jid, True)
+        try: await app.send_message(j["owner"], summary(jid))
+        except Exception: pass
 
 @app.on_callback_query()
 async def callbacks(_, q: CallbackQuery):
@@ -390,7 +445,12 @@ async def callbacks(_, q: CallbackQuery):
     jid = parts[-1]
     if jid not in jobs: return await q.answer("Unknown job", show_alert=True)
     if action == "start": await q.answer(); return await launch(jid, q.message)
-    if action == "cancel": jobs[jid]["cancel_requested"] = True; jobs[jid]["status"] = "cancelling"; await save(); return await q.answer("Cancellation requested")
+    if action == "cancel":
+        jobs[jid]["cancel_requested"] = True
+        if jobs[jid].get("status") == "queued":
+            queued_jobs.discard(jid); jobs[jid]["status"] = "cancelled"
+        else: jobs[jid]["status"] = "cancelling"
+        await save(); return await q.answer("Cancellation requested")
     if action == "clear": jobs[jid]["meta"]["cover_path"] = None; await save(); return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
     if action == "cover": return await q.answer(f"Send image with caption /cover {jid}", show_alert=True)
     if action == "s":
