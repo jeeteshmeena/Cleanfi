@@ -1,7 +1,6 @@
 .env
-*.session
-*.session-journal
+.venv/
 __pycache__/
-*.py[cod]
+*.pyc
 tmp/
 logs/
