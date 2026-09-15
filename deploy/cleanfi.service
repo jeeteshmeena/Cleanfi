@@ -1,14 +1,18 @@
 [Unit]
-Description=Cleanfi Telegram Bot
-After=network.target
+Description=Cleanfi Telegram Metadata Bot
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
+User=cleanfi
 WorkingDirectory=/opt/cleanfi
 EnvironmentFile=/opt/cleanfi/.env
 ExecStart=/opt/cleanfi/.venv/bin/python /opt/cleanfi/bot.py
 Restart=always
 RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target

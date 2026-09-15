@@ -1,40 +1,80 @@
 # Cleanfi
 
-Telegram audiobook metadata cleaner/repacker.
+Production-oriented Telegram audiobook metadata cleaner.
 
-## Current production architecture
+## Features
 
-Pyrogram + Mutagen, persistent JSON job store, per-job metadata, inline job controls, FloodWait handling, temporary-file cleanup, and systemd deployment template.
+- Per-job metadata profiles: each range can have different Artist, Genre, Year, Album, Album Artist and Comment.
+- Original title is preserved by default.
+- Cleans existing tags before writing the configured values.
+- MP3, M4A/MP4, FLAC, OGG, Opus, WAV/AIFF and WMA handling through Mutagen where supported.
+- Cover upload per job for formats that support embedded artwork.
+- Range processing is inclusive.
+- FloodWait-aware download/upload loops.
+- Job persistence in `jobs.json`.
+- Admin-only private control surface.
+- Inline metadata controls plus command interface.
+- `/test`, `/status`, `/cancel`, `/retry`, `/failed` and `/jobs`.
 
-## Setup
+## Important format note
 
-1. Copy `.env.example` to `.env` and fill API_ID, API_HASH, BOT_TOKEN, source/target chat IDs and ADMIN_IDS.
-2. Install Python 3.10+ and FFmpeg if needed by future format handlers.
-3. Create venv: `python3 -m venv .venv && . .venv/bin/activate`.
-4. Install: `pip install -r requirements.txt`.
-5. Test: `python bot.py`.
-6. For systemd copy `deploy/cleanfi.service` to `/etc/systemd/system/`, then `sudo systemctl daemon-reload && sudo systemctl enable --now cleanfi`.
+Raw AAC/ADTS does not provide a portable container for arbitrary embedded cover/tag data. Cleanfi intentionally does not transcode it silently. It will preserve the audio bytes rather than claim unsupported metadata was written.
+
+WAV/AIFF/WMA metadata capabilities depend on the exact container/tag implementation. The bot reports processing failures instead of pretending an unsupported tag was embedded.
+
+## VPS setup
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip ffmpeg git
+sudo useradd --system --create-home --shell /usr/sbin/nologin cleanfi || true
+sudo mkdir -p /opt/cleanfi
+sudo chown -R cleanfi:cleanfi /opt/cleanfi
+sudo -u cleanfi git clone https://github.com/jeeteshmeena/Cleanfi.git /opt/cleanfi
+cd /opt/cleanfi
+sudo -u cleanfi python3 -m venv .venv
+sudo -u cleanfi .venv/bin/pip install --upgrade pip
+sudo -u cleanfi .venv/bin/pip install -r requirements.txt
+sudo cp .env.example .env
+sudo chown cleanfi:cleanfi .env
+sudo chmod 600 .env
+sudo nano .env
+```
+
+Set API_ID, API_HASH, BOT_TOKEN, SOURCE_CHAT_ID, TARGET_CHAT_ID and ADMIN_IDS.
+
+Then:
+
+```bash
+sudo cp deploy/cleanfi.service /etc/systemd/system/cleanfi.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now cleanfi
+sudo systemctl status cleanfi
+journalctl -u cleanfi -f
+```
 
 ## Usage
 
-`/range 1250 1300`
+```text
+/range 1250 1300
+```
 
-Then configure this job only:
+Configure with inline buttons, or:
 
-`/meta artist="Artist A" genre="Romance" year=2026`
+```text
+/meta artist="Artist A" genre="Romance" year=2026 album="Book A"
+```
 
-Then `/startjob` or the inline Start button.
+Then press **START** or:
 
-Each job stores its own metadata, so later ranges can use different values.
+```text
+/startjob JOB_ID
+```
 
-## Commands
+For a cover, send the image with:
 
-`/start`, `/help`, `/range START END`, `/meta key=value`, `/startjob`, `/status [JOB]`.
+```text
+/cover JOB_ID
+```
 
-## Security
-
-Only ADMIN_IDS can use the bot. Never commit `.env`, bot tokens, API hashes, or session files.
-
-## Important
-
-This repository is a functional baseline, not a guarantee that every audio container supports every metadata field or embedded artwork. Format-specific handlers should be extended and tested with representative files before processing a large library. Do not re-encode audio merely to change tags.
+The source message caption is preserved on upload. The original filename is preserved.

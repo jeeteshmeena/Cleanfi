@@ -1,38 +1,126 @@
 from pathlib import Path
 from mutagen import File
-from mutagen.id3 import ID3, ID3NoHeaderError, TIT2, TPE1, TCON, TDRC, TALB, TPE2, COMM, APIC
+from mutagen.id3 import ID3, APIC, TIT2, TPE1, TCON, TDRC, TALB, TPE2, COMM, ID3NoHeaderError
+from mutagen.mp4 import MP4, MP4Cover
+from mutagen.flac import FLAC, Picture
+from mutagen.oggopus import OggOpus
+from mutagen.oggvorbis import OggVorbis
+from mutagen.wave import WAVE
+from mutagen.aiff import AIFF
+import shutil
+
+
+def _clean_id3(path):
+    try:
+        tags=ID3(path)
+    except ID3NoHeaderError:
+        tags=ID3()
+    tags.clear()
+    tags.save(path)
+
 
 def clean_and_apply_metadata(input_path, output_path, *, title=None, artist=None, genre=None, year=None, cover=None, album=None, album_artist=None, comment=None):
-    p=Path(input_path); q=Path(output_path); q.write_bytes(p.read_bytes())
-    f=File(str(q), easy=False)
-    if f is None: raise ValueError(f'Unsupported audio container: {p.suffix}')
-    old_title=None
-    try:
-        if hasattr(f,'get'): old_title=(f.get('title') or [None])[0]
-        if p.suffix.lower()=='.mp3':
-            try: tags=ID3(str(q)); old_title=(tags.get('TIT2').text[0] if tags.get('TIT2') else old_title); tags.delete(str(q))
-            except ID3NoHeaderError: pass
-            tags=ID3();
-            if title is not None: tags.add(TIT2(encoding=3,text=title))
-            elif old_title: tags.add(TIT2(encoding=3,text=old_title))
-            if artist: tags.add(TPE1(encoding=3,text=artist))
-            if genre: tags.add(TCON(encoding=3,text=genre))
-            if year: tags.add(TDRC(encoding=3,text=str(year)))
-            if album: tags.add(TALB(encoding=3,text=album))
-            if album_artist: tags.add(TPE2(encoding=3,text=album_artist))
-            if comment: tags.add(COMM(encoding=3,lang='eng',desc='',text=comment))
-            if cover:
-                data=Path(cover).read_bytes(); mime='image/png' if Path(cover).suffix.lower()=='.png' else 'image/jpeg'; tags.add(APIC(encoding=3,mime=mime,type=3,desc='Cover',data=data))
-            tags.save(str(q),v2_version=3)
-        else:
-            # Mutagen's easy tags are portable for common Vorbis/MP4 containers.
-            if f.tags is None: f.add_tags()
-            f.tags.clear()
-            if title is not None: f.tags['title']=[title]
-            elif old_title: f.tags['title']=[old_title]
-            for k,v in [('artist',artist),('genre',genre),('date',str(year) if year else None),('album',album),('albumartist',album_artist),('comment',comment)]:
-                if v: f.tags[k]=[v]
-            f.save()
-            # Cover support outside MP3 is container-specific; report unsupported embedding rather than corrupting audio.
-            if cover: raise ValueError(f'Cover embedding is not implemented for {p.suffix.lower()} yet')
-    return str(q)
+    src=Path(input_path); dst=Path(output_path)
+    shutil.copy2(src,dst)
+    ext=src.suffix.lower()
+    cover_bytes=Path(cover).read_bytes() if cover and Path(cover).exists() else None
+
+    if ext=='.mp3':
+        _clean_id3(dst)
+        tags=ID3(dst)
+        if title is not None: tags.add(TIT2(encoding=3,text=title))
+        if artist: tags.add(TPE1(encoding=3,text=artist))
+        if genre: tags.add(TCON(encoding=3,text=genre))
+        if year: tags.add(TDRC(encoding=3,text=str(year)))
+        if album: tags.add(TALB(encoding=3,text=album))
+        if album_artist: tags.add(TPE2(encoding=3,text=album_artist))
+        if comment: tags.add(COMM(encoding=3,lang='eng',desc='',text=comment))
+        if cover_bytes: tags.add(APIC(encoding=3,mime='image/jpeg' if cover_bytes[:3]==b'\xff\xd8\xff' else 'image/png',type=3,desc='Cover',data=cover_bytes))
+        tags.save(dst); return
+
+    if ext in {'.m4a','.mp4'}:
+        m=MP4(dst); m.clear()
+        if title is not None: m['\xa9nam']=[title]
+        if artist: m['\xa9ART']=[artist]
+        if genre: m['\xa9gen']=[genre]
+        if year: m['\xa9day']=[str(year)]
+        if album: m['\xa9alb']=[album]
+        if album_artist: m['aART']=[album_artist]
+        if comment: m['\xa9cmt']=[comment]
+        if cover_bytes: m['covr']=[MP4Cover(cover_bytes, imageformat=MP4Cover.FORMAT_JPEG if cover_bytes[:3]==b'\xff\xd8\xff' else MP4Cover.FORMAT_PNG)]
+        m.save(); return
+
+    if ext=='.flac':
+        f=FLAC(dst); f.clear();
+        if title is not None: f['title']=[title]
+        if artist: f['artist']=[artist]
+        if genre: f['genre']=[genre]
+        if year: f['date']=[str(year)]
+        if album: f['album']=[album]
+        if album_artist: f['albumartist']=[album_artist]
+        if comment: f['comment']=[comment]
+        if cover_bytes:
+            p=Picture(); p.type=3; p.mime='image/jpeg' if cover_bytes[:3]==b'\xff\xd8\xff' else 'image/png'; p.data=cover_bytes; f.add_picture(p)
+        f.save(); return
+
+    if ext=='.ogg':
+        f=OggVorbis(dst); f.clear()
+        if title is not None: f['title']=[title]
+        if artist: f['artist']=[artist]
+        if genre: f['genre']=[genre]
+        if year: f['date']=[str(year)]
+        if album: f['album']=[album]
+        if album_artist: f['albumartist']=[album_artist]
+        if comment: f['comment']=[comment]
+        f.save(); return
+
+    if ext=='.opus':
+        f=OggOpus(dst); f.clear()
+        if title is not None: f['title']=[title]
+        if artist: f['artist']=[artist]
+        if genre: f['genre']=[genre]
+        if year: f['date']=[str(year)]
+        if album: f['album']=[album]
+        if album_artist: f['albumartist']=[album_artist]
+        if comment: f['comment']=[comment]
+        f.save(); return
+
+    if ext in {'.wav','.aiff','.aif'}:
+        # Mutagen support varies by container; clear/write only when supported.
+        f=File(dst,easy=True)
+        if f is not None:
+            try: f.clear()
+            except Exception: pass
+            if title is not None: f['title']=[title]
+            if artist: f['artist']=[artist]
+            if genre: f['genre']=[genre]
+            if year: f['date']=[str(year)]
+            if album: f['album']=[album]
+            if album_artist: f['albumartist']=[album_artist]
+            if comment: f['comment']=[comment]
+            try: f.save()
+            except Exception: pass
+        return
+
+    if ext=='.wma':
+        f=File(dst,easy=True)
+        if f is None: return
+        try: f.clear()
+        except Exception: pass
+        if title is not None: f['title']=[title]
+        if artist: f['artist']=[artist]
+        if genre: f['genre']=[genre]
+        if year: f['date']=[str(year)]
+        if album: f['album']=[album]
+        if album_artist: f['albumartist']=[album_artist]
+        if comment: f['comment']=[comment]
+        try: f.save()
+        except Exception: pass
+        return
+
+    if ext=='.aac':
+        # Raw AAC/ADTS has no portable embedded artwork/tag container.
+        # Keep audio bytes intact rather than falsely claiming metadata was embedded.
+        return
+
+    raise ValueError(f'Unsupported audio container: {ext}')
