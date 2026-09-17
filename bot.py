@@ -3,6 +3,7 @@ import logging
 
 import cleanfi_v2 as core
 from pyrogram import filters, idle
+from pyrogram.handlers import RawUpdateHandler
 
 
 logging.basicConfig(
@@ -12,9 +13,18 @@ logging.basicConfig(
 log = logging.getLogger("cleanfi")
 
 
+async def _raw_update(_, update, users, chats):
+    """Lowest-level update probe; bypasses all Pyrogram message filters."""
+    log.info("RAW TELEGRAM UPDATE: %s", type(update).__name__)
+
+
+# Register this explicitly instead of relying on the decorator API.  If Telegram
+# delivers any update to this process, this handler must see it.
+core.app.add_handler(RawUpdateHandler(_raw_update), group=-1000)
+
+
 # Diagnostic fallback: this runs before normal message handlers and proves that
-# Telegram updates are reaching the process. It is intentionally limited to
-# private text messages so it cannot interfere with channel/audio processing.
+# private text messages are reaching the message dispatcher.
 @core.app.on_message(filters.private & filters.text, group=-100)
 async def _entry_fallback(_, message):
     text = (message.text or "").strip().split(maxsplit=1)[0].lower()
