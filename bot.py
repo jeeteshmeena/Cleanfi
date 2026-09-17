@@ -12,21 +12,17 @@ logging.basicConfig(
 log = logging.getLogger("cleanfi")
 
 
-@core.app.on_raw_update()
-async def _raw_update(_, update, users, chats):
-    # This is intentionally lightweight: it proves Telegram updates are
-    # reaching the process even if a high-level filter does not match.
-    log.debug("Telegram update received: %s", type(update).__name__)
-
-
-@core.app.on_message(filters.private & filters.text, group=-1)
+# Diagnostic fallback: this runs before normal message handlers and proves that
+# Telegram updates are reaching the process. It is intentionally limited to
+# private text messages so it cannot interfere with channel/audio processing.
+@core.app.on_message(filters.private & filters.text, group=-100)
 async def _entry_fallback(_, message):
     text = (message.text or "").strip().split(maxsplit=1)[0].lower()
+    user_id = message.from_user.id if message.from_user else None
+    log.info("Incoming private message: user=%s text=%r", user_id, message.text)
+
     if text not in ("/start", "/menu"):
         return
-
-    user_id = message.from_user.id if message.from_user else None
-    log.info("Incoming %s from user=%s", text, user_id)
 
     if user_id not in core.ADMINS:
         log.warning("Unauthorized %s from user=%s", text, user_id)
@@ -38,6 +34,7 @@ async def _entry_fallback(_, message):
             "CLEANFI\n\nAudiobook metadata cleaner and repacker.",
             reply_markup=core.menu(),
         )
+        log.info("Replied successfully to %s from user=%s", text, user_id)
     except Exception:
         log.exception("Failed to reply to %s from user=%s", text, user_id)
     message.stop_propagation()
@@ -45,26 +42,35 @@ async def _entry_fallback(_, message):
 
 async def main_async():
     core.load()
+
+    log.info("Starting Cleanfi Telegram client...")
     await core.app.start()
 
-    me = await core.app.get_me()
-    log.info(
-        "Cleanfi connected as @%s (id=%s, is_bot=%s)",
-        me.username or "-",
-        me.id,
-        me.is_bot,
-    )
-    log.info("Admins configured: %d", len(core.ADMINS))
-    log.info("Handler groups: %d", len(getattr(core.app.dispatcher, "groups", {})))
-
-    if not me.is_bot:
-        raise RuntimeError("The active Pyrogram session is not a bot account")
-
-    if core.queue:
-        core.queue_task = asyncio.create_task(core.worker(), name="cleanfi-queue-worker")
-        log.info("Recovered %d queued job(s)", len(core.queue))
-
     try:
+        me = await core.app.get_me()
+        log.info(
+            "Telegram connection ready: @%s | id=%s | is_bot=%s",
+            me.username or "-",
+            me.id,
+            me.is_bot,
+        )
+        log.info("Configured admin IDs: %s", sorted(core.ADMINS))
+        log.info(
+            "Source=%s | Target=%s | Queue=%d",
+            core.settings.get("source", ""),
+            core.settings.get("target", ""),
+            len(core.queue),
+        )
+
+        if not me.is_bot:
+            raise RuntimeError("The active Pyrogram session is not a bot account")
+
+        if core.queue:
+            core.queue_task = asyncio.create_task(
+                core.worker(), name="cleanfi-queue-worker"
+            )
+            log.info("Recovered %d queued job(s)", len(core.queue))
+
         await idle()
     finally:
         task = core.queue_task
