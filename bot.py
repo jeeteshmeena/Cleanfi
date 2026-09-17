@@ -12,44 +12,41 @@ logging.basicConfig(
 log = logging.getLogger("cleanfi")
 
 
-# High-priority fallback for the two entry commands. It intentionally uses
-# plain private text matching instead of filters.command so a command-parser
-# problem cannot make the bot appear completely dead. stop_propagation()
-# prevents the original /start handler from replying a second time.
+@core.app.on_raw_update()
+async def _raw_update(_, update, users, chats):
+    # This is intentionally lightweight: it proves Telegram updates are
+    # reaching the process even if a high-level filter does not match.
+    log.debug("Telegram update received: %s", type(update).__name__)
+
+
 @core.app.on_message(filters.private & filters.text, group=-1)
 async def _entry_fallback(_, message):
     text = (message.text or "").strip().split(maxsplit=1)[0].lower()
     if text not in ("/start", "/menu"):
         return
+
     user_id = message.from_user.id if message.from_user else None
     log.info("Incoming %s from user=%s", text, user_id)
-    if user_id in core.ADMINS:
+
+    if user_id not in core.ADMINS:
+        log.warning("Unauthorized %s from user=%s", text, user_id)
+        message.stop_propagation()
+        return
+
+    try:
         await message.reply_text(
             "CLEANFI\n\nAudiobook metadata cleaner and repacker.",
             reply_markup=core.menu(),
         )
-    else:
-        log.warning("Unauthorized %s from user=%s", text, user_id)
+    except Exception:
+        log.exception("Failed to reply to %s from user=%s", text, user_id)
     message.stop_propagation()
 
 
 async def main_async():
     core.load()
-
-    # Use a dedicated bot session name. The previous runtime used the generic
-    # "cleanfi" session, which could leave an old/stale Pyrogram session in use.
-    # Keep the old session untouched as a backup.
-    try:
-        core.app.name = "cleanfi_bot"
-        if hasattr(core.app, "storage") and hasattr(core.app.storage, "name"):
-            core.app.storage.name = "cleanfi_bot"
-    except Exception:
-        log.exception("Could not switch to the dedicated bot session name")
-
     await core.app.start()
 
-    # Verify the authenticated identity immediately so a wrong/stale session
-    # cannot look like a healthy but unresponsive bot.
     me = await core.app.get_me()
     log.info(
         "Cleanfi connected as @%s (id=%s, is_bot=%s)",
