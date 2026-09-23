@@ -142,7 +142,7 @@ async def resolve_chat(value):
     value = str(value).strip()
     return await tg_call(lambda: app.get_chat(int(value) if re.fullmatch(r"-?\d+", value) else value), label="get_chat")
 
-async def safe_progress(jid, force=False):(jid, force=False):
+async def safe_progress(jid, force=False):
     j = jobs[jid]; now = time.time()
     if not force and now - j.get("last_progress", 0) < 2:
         return
