@@ -385,6 +385,21 @@ async def process_file(jid, mid):
             try: p.unlink()
             except FileNotFoundError: pass
 
+async def process_file_with_retry(jid, mid):
+    attempt = 0
+    while True:
+        try:
+            return await process_file(jid, mid)
+        except FloodWait:
+            raise
+        except Exception:
+            attempt += 1
+            jobs[jid]["retries"] = jobs[jid].get("retries", 0) + 1
+            await save()
+            if attempt > int(settings.get("retries", DEFAULT_RETRIES)):
+                raise
+            await asyncio.sleep(min(30, 2 ** attempt))
+
 async def launch(jid, m, ids=None):
     global job_queue, queue_task
     if jid in running or jid in queued_jobs:
@@ -446,7 +461,7 @@ async def run_job(jid, ids=None):
             if j.get("cancel_requested"): break
             j["current"] = mid; await safe_progress(jid, True)
             try:
-                result, reason = await process_file(jid, mid)
+                result, reason = await process_file_with_retry(jid, mid)
                 if result == "ok":
                     if mid not in j["processed"]: j["processed"].append(mid)
                 elif result == "skip":
