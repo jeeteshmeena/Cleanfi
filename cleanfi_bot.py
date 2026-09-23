@@ -683,13 +683,13 @@ async def run_job(jid, ids=None):
                         j["status"] = "running"
                         await save()
                         await safe_progress(jid, True)
-            if result == "ok":
-                if mid not in j["processed"]: j["processed"].append(mid)
-            elif result == "skip":
-                if mid not in j["skipped"]: j["skipped"].append(mid)
-            else:
-                if mid not in j["failed"]: j["failed"].append(mid)
-                j["failed_reasons"][str(mid)] = reason or "unknown"
+                if result == "ok":
+                    if mid not in j["processed"]: j["processed"].append(mid)
+                elif result == "skip":
+                    if mid not in j["skipped"]: j["skipped"].append(mid)
+                else:
+                    if mid not in j["failed"]: j["failed"].append(mid)
+                    j["failed_reasons"][str(mid)] = reason or "unknown"
             except Exception as e:
                 if mid not in j["failed"]: j["failed"].append(mid)
                 j["failed_reasons"][str(mid)] = f"{type(e).__name__}: {e}"
