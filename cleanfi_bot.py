@@ -61,7 +61,7 @@ def load():
     settings.setdefault("file_delay", DEFAULT_DELAY_SECONDS)
     settings["file_delay"] = min(MAX_DELAY_SECONDS, max(MIN_DELAY_SECONDS, int(settings["file_delay"])))
     settings.setdefault("min_free_gb", MIN_FREE_DISK_GB)
-    settings.setdefault("global_meta", {"artist": None, "genre": None, "year": None, "album": None, "album_artist": None, "comment": None, "cover_path": g.get("cover_path")})
+    settings.setdefault("global_meta", {"artist": None, "genre": None, "year": None, "album": None, "album_artist": None, "comment": None, "cover_path": None})
     for j in jobs.values():
         j.setdefault("source", settings["source"]); j.setdefault("target", settings["target"])
         j.setdefault("processed", []); j.setdefault("failed", []); j.setdefault("skipped", [])
