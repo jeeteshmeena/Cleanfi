@@ -366,6 +366,8 @@ async def meta_cmd(_, m):
 @app.on_message(filters.private & filters.photo)
 async def cover_photo(_, m):
     if not allowed(m): return
+    if sessions.get((m.from_user.id, "startpost")):
+        return
     p = (m.caption or "").split(); jid = p[1] if len(p) == 2 and p[0].lower() == "/cover" else active(m)
     if not jid or jid not in jobs: return
     d = TEMP / jid; d.mkdir(exist_ok=True); path = d / "cover.jpg"
