@@ -15,7 +15,9 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMINS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 TEMP = Path(os.getenv("TEMP_DIR", "./tmp")); TEMP.mkdir(parents=True, exist_ok=True)
 STATE = Path(os.getenv("STATE_FILE", "./jobs.json"))
-FILE_DELAY = max(3, int(os.getenv("FILE_DELAY_SECONDS", "3")))
+MIN_DELAY_SECONDS = 3
+MAX_DELAY_SECONDS = 60
+DEFAULT_DELAY_SECONDS = min(MAX_DELAY_SECONDS, max(MIN_DELAY_SECONDS, int(os.getenv("FILE_DELAY_SECONDS", "3"))))
 MAX_QUEUE = max(1, int(os.getenv("MAX_QUEUED_JOBS", "20")))
 DEFAULT_RETRIES = max(0, int(os.getenv("TRANSIENT_RETRIES", "5")))
 MIN_FREE_DISK_GB = max(0, int(os.getenv("MIN_FREE_DISK_GB", "2")))
@@ -55,6 +57,8 @@ def load():
     settings.setdefault("source", os.getenv("SOURCE_CHAT_ID", ""))
     settings.setdefault("target", os.getenv("TARGET_CHAT_ID", ""))
     settings.setdefault("retries", DEFAULT_RETRIES)
+    settings.setdefault("file_delay", DEFAULT_DELAY_SECONDS)
+    settings["file_delay"] = min(MAX_DELAY_SECONDS, max(MIN_DELAY_SECONDS, int(settings["file_delay"])))
     settings.setdefault("min_free_gb", MIN_FREE_DISK_GB)
     for j in jobs.values():
         j.setdefault("source", settings["source"]); j.setdefault("target", settings["target"])
@@ -71,6 +75,10 @@ def allowed(m):
 
 def active(m):
     return sessions.get(m.from_user.id)
+
+def get_delay(jid):
+    value = jobs.get(jid, {}).get("delay_seconds", settings.get("file_delay", DEFAULT_DELAY_SECONDS))
+    return min(MAX_DELAY_SECONDS, max(MIN_DELAY_SECONDS, int(value)))
 
 def getjid(m):
     p = (m.text or "").split()
@@ -162,6 +170,7 @@ def main_kb():
         [InlineKeyboardButton("✦ New Job", callback_data="m:new"), InlineKeyboardButton("◈ Jobs", callback_data="m:jobs")],
         [InlineKeyboardButton("▸ Source", callback_data="m:source"), InlineKeyboardButton("▸ Target", callback_data="m:target")],
         [InlineKeyboardButton("✧ Status", callback_data="m:status"), InlineKeyboardButton("✧ Failed", callback_data="m:failed")],
+        [InlineKeyboardButton("⏱ Delay", callback_data="m:delay")],
         [InlineKeyboardButton("❖ Help", callback_data="m:help")],
     ])
 
@@ -185,15 +194,15 @@ def summary(jid):
             f"Artist: {m.get('artist') or '—'}\nGenre: {m.get('genre') or '—'}\nYear: {m.get('year') or '—'}\n"
             f"Album: {m.get('album') or '—'}\nAlbum Artist: {m.get('album_artist') or '—'}\n"
             f"Comment: {m.get('comment') or '—'}\nCover: {'Attached' if m.get('cover_path') else 'Not attached'}\n"
-            f"Title: Original source title\n\nProcessed: {len(j['processed'])}/{j['total']} | Failed: {len(j['failed'])} | Skipped: {len(j['skipped'])}")
+            f"Title: Original source title\nDelay: {get_delay(jid)}s between episodes\n\nProcessed: {len(j['processed'])}/{j['total']} | Failed: {len(j['failed'])} | Skipped: {len(j['skipped'])}")
 
 async def create_job(owner, start, end):
     jid = uuid.uuid4().hex[:8]
     jobs[jid] = {"id": jid, "owner": owner, "start": start, "end": end, "total": end-start+1,
                  "processed": [], "failed": [], "failed_reasons": {}, "skipped": [], "status": "configured",
                  "cancel_requested": False, "meta": newmeta(), "source": settings["source"], "target": settings["target"],
-                 "created": time.time(), "started_at": None, "progress_message_id": None, "last_progress": 0,
-                 "current": None, "flood_until": 0, "queue_ids": None}
+                 "created": time.time(), "started_at": None, "progress_message_id": None,
+                 "current": None, "flood_until": 0, "queue_ids": None, "delay_seconds": int(settings.get("file_delay", DEFAULT_DELAY_SECONDS))}
     sessions[owner] = jid
     await save()
     return jid
@@ -227,7 +236,7 @@ async def start_cmd(_, m):
 @app.on_message(filters.private & filters.command("help"))
 async def help_cmd(_, m):
     if allowed(m):
-        await m.reply_text("✦ CLEANFI\n\n/range START END\n/source @channel\n/target @channel\n/meta artist=\"Name\" genre=\"Romance\" year=2026\n/cover JOBID\n/startjob JOBID\n/status JOBID\n/cancel JOBID\n/retry JOBID\n/failed JOBID\n/test MESSAGE_ID\n/jobs", reply_markup=main_kb())
+        await m.reply_text("✦ CLEANFI\n\n/range START END\n/source @channel\n/target @channel\n/meta artist=\"Name\" genre=\"Romance\" year=2026\n/cover JOBID\n/startjob JOBID\n/status JOBID\n/delay SECONDS\n/cancel JOBID\n/retry JOBID\n/failed JOBID\n/test MESSAGE_ID\n/jobs", reply_markup=main_kb())
 
 @app.on_message(filters.private & filters.command("source"))
 async def source_cmd(_, m):
@@ -248,6 +257,23 @@ async def target_cmd(_, m):
         c = await resolve_chat(p[1]); settings["target"] = str(c.id); await save()
         await m.reply_text(f"✦ Target set\n{c.title or c.first_name}\nID: {c.id}", reply_markup=main_kb())
     except Exception as e: await m.reply_text(f"Could not set target: {type(e).__name__}: {e}")
+
+@app.on_message(filters.private & filters.command("delay"))
+async def delay_cmd(_, m):
+    if not allowed(m): return
+    p = (m.text or "").split()
+    if len(p) != 2 or not p[1].isdigit():
+        return await m.reply_text(f"Usage: /delay 3  (allowed: {MIN_DELAY_SECONDS}-{MAX_DELAY_SECONDS} seconds)")
+    seconds = int(p[1])
+    if seconds < MIN_DELAY_SECONDS or seconds > MAX_DELAY_SECONDS:
+        return await m.reply_text(f"Delay must be between {MIN_DELAY_SECONDS} and {MAX_DELAY_SECONDS} seconds.")
+    settings["file_delay"] = seconds
+    await save()
+    jid = active(m)
+    if jid and jid in jobs and jobs[jid].get("status") in {"configured","paused","cancelled","completed","completed_with_failures"}:
+        jobs[jid]["delay_seconds"] = seconds
+        await save()
+    await m.reply_text(f"Episode delay set to {seconds} seconds. New jobs will use this delay.")
 
 @app.on_message(filters.private & filters.command("range"))
 async def range_cmd(_, m):
@@ -477,7 +503,7 @@ async def run_job(jid, ids=None):
             finally:
                 j["current"] = None; await save(); await safe_progress(jid, True)
                 if not j.get("cancel_requested"):
-                    await asyncio.sleep(FILE_DELAY)
+                    await asyncio.sleep(get_delay(jid))
         if j.get("cancel_requested"):
             j["status"] = "cancelled"
         elif j["failed"]:
@@ -501,6 +527,7 @@ async def callbacks(_, q: CallbackQuery):
         if sub == "target": await q.answer("Use /target @channelusername", show_alert=True); return
         if sub == "status": await q.answer("Use /status JOB_ID", show_alert=True); return
         if sub == "failed": await q.answer("Use /failed JOB_ID", show_alert=True); return
+        if sub == "delay": await q.answer("Use /delay 3 to /delay 60", show_alert=True); return
         if sub == "help": await q.answer(); return await q.message.reply_text("Use /help for all commands.")
     jid = parts[-1]
     if jid not in jobs: return await q.answer("Unknown job", show_alert=True)
