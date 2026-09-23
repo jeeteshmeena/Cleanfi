@@ -1,4 +1,5 @@
-from cleanfi_v2 import main
+# Cleanfi entrypoint
+from cleanfi_bot import main
 
 if __name__ == "__main__":
     main()
