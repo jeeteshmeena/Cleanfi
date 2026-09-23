@@ -61,6 +61,7 @@ def load():
     settings.setdefault("file_delay", DEFAULT_DELAY_SECONDS)
     settings["file_delay"] = min(MAX_DELAY_SECONDS, max(MIN_DELAY_SECONDS, int(settings["file_delay"])))
     settings.setdefault("min_free_gb", MIN_FREE_DISK_GB)
+    settings.setdefault("global_meta", {"artist": None, "genre": None, "year": None, "album": None, "album_artist": None, "comment": None})
     for j in jobs.values():
         j.setdefault("source", settings["source"]); j.setdefault("target", settings["target"])
         j.setdefault("processed", []); j.setdefault("failed", []); j.setdefault("skipped", [])
@@ -95,9 +96,12 @@ def infer_name(media):
 
 END_POST_TEXT = "Hey, the story is complete. Hope you like it 🫶🏻.\n\nIf you're looking for another story, then try… @StoriesByJeetXNew"
 
+GENRE_OPTIONS = ["Drama", "Fantasy", "Suspense & Thriller", "Horror", "Romance", "System", "Romantasy"]
+
 def newmeta():
-    return {"title_mode": "original", "artist": None, "genre": None, "year": None,
-            "album": None, "album_artist": None, "comment": None, "cover_path": None}
+    g = settings.get("global_meta", {})
+    return {"title_mode": "original", "artist": g.get("artist"), "genre": g.get("genre"), "year": g.get("year"),
+            "album": g.get("album"), "album_artist": g.get("album_artist"), "comment": g.get("comment"), "cover_path": None}
 
 async def tg_call(fn, jid=None, label="Telegram"):
     """Single-flight Telegram call with infinite FloodWait retry.
@@ -181,7 +185,7 @@ def job_kb(jid):
     m = jobs[jid]["meta"]
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"Artist: {m.get('artist') or '—'}", callback_data=f"s:artist:{jid}")],
-        [InlineKeyboardButton(f"Genre: {m.get('genre') or '—'}", callback_data=f"s:genre:{jid}")],
+        [InlineKeyboardButton(f"Genre: {m.get('genre') or '—'}", callback_data=f"s:genre:{jid}"), InlineKeyboardButton("Choose", callback_data=f"genre:{jid}")],
         [InlineKeyboardButton(f"Year: {m.get('year') or '—'}", callback_data=f"s:year:{jid}")],
         [InlineKeyboardButton(f"Album: {m.get('album') or '—'}", callback_data=f"s:album:{jid}")],
         [InlineKeyboardButton(f"Album Artist: {m.get('album_artist') or '—'}", callback_data=f"s:album_artist:{jid}")],
@@ -352,6 +356,19 @@ async def range_cmd(_, m):
         return await m.reply_text("Set /source and /target first.", reply_markup=main_kb())
     jid = await create_job(m.from_user.id, int(p[1]), int(p[2]))
     await m.reply_text(summary(jid), reply_markup=job_kb(jid))
+
+@app.on_message(filters.private & filters.command("globalmeta"))
+async def globalmeta_cmd(_, m):
+    if not allowed(m): return
+    pairs = re.findall(r'(\w+)=(?:"([^"]*)"|\'([^\']*)\'|(\S+))', (m.text or "")[11:].strip())
+    if not pairs:
+        g = settings.get("global_meta", {})
+        return await m.reply_text("Global: " + json.dumps(g, ensure_ascii=False) + "\nUse /globalmeta artist=\"Name\" album_artist=\"Name\" album=\"Story\" genre=\"Romance\" year=2026")
+    g = settings.setdefault("global_meta", {})
+    for k,a,b,c in pairs:
+        if k in {"artist","genre","year","album","album_artist","comment"}: g[k] = a or b or c
+    await save()
+    await m.reply_text("Global metadata saved. New jobs will inherit these values.")
 
 @app.on_message(filters.private & filters.command("meta"))
 async def meta_cmd(_, m):
@@ -605,15 +622,13 @@ async def run_job(jid, ids=None):
                         j["status"] = "running"
                         await save()
                         await safe_progress(jid, True)
-            except FloodWait:
-                raise
             if result == "ok":
-                    if mid not in j["processed"]: j["processed"].append(mid)
-                elif result == "skip":
-                    if mid not in j["skipped"]: j["skipped"].append(mid)
-                else:
-                    if mid not in j["failed"]: j["failed"].append(mid)
-                    j["failed_reasons"][str(mid)] = reason or "unknown"
+                if mid not in j["processed"]: j["processed"].append(mid)
+            elif result == "skip":
+                if mid not in j["skipped"]: j["skipped"].append(mid)
+            else:
+                if mid not in j["failed"]: j["failed"].append(mid)
+                j["failed_reasons"][str(mid)] = reason or "unknown"
             except Exception as e:
                 if mid not in j["failed"]: j["failed"].append(mid)
                 j["failed_reasons"][str(mid)] = f"{type(e).__name__}: {e}"
@@ -667,6 +682,22 @@ async def callbacks(_, q: CallbackQuery):
         await save(); return await q.answer("Cancellation requested")
     if action == "clear": jobs[jid]["meta"]["cover_path"] = None; await save(); return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
     if action == "cover": return await q.answer(f"Send image with caption /cover {jid}", show_alert=True)
+    if action == "genre":
+        await q.answer()
+        rows = [[InlineKeyboardButton(x, callback_data=f"g:{jid}:{i}")] for i,x in enumerate(GENRE_OPTIONS)]
+        rows.append([InlineKeyboardButton("Custom", callback_data=f"gc:{jid}")])
+        return await q.message.reply_text("Choose genre:", reply_markup=InlineKeyboardMarkup(rows))
+    if action == "g":
+        idx = int(parts[2])
+        jobs[jid]["meta"]["genre"] = GENRE_OPTIONS[idx]
+        await save()
+        await q.answer(f"Genre: {GENRE_OPTIONS[idx]}")
+        return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
+    if action == "gc":
+        sessions[q.from_user.id] = jid
+        sessions[(q.from_user.id, "field")] = "genre"
+        await q.answer()
+        return await q.message.reply_text("Send custom genre.")
     if action == "s":
         field = parts[1]; sessions[q.from_user.id] = jid; sessions[(q.from_user.id, "field")] = field
         await q.answer(); return await q.message.reply_text(f"Send {field} value as the next message.")
