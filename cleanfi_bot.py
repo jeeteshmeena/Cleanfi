@@ -422,112 +422,33 @@ async def startpost_cmd(_, m):
     sessions[(m.from_user.id, "startpost")] = True
     await m.reply_text(f"Send the start image now with the story name as its caption.\nJob: {jid}")
 
-@app.on_message(filters.private & filters.photo)
-async def startpost_photo(_, m):
-    if not allowed(m): return
-    if not sessions.get((m.from_user.id, "startpost")):
+@app.on_message(filters.private & (filters.photo | filters.document), group=-80)
+async def cover_media(_, m):
+    if not allowed(m):
         return
-    jid = sessions.get(m.from_user.id)
-    if not jid or jid not in jobs:
-        sessions.pop((m.from_user.id, "startpost"), None)
-        return await m.reply_text("Unknown job. Create/select the job again.")
-    caption = (m.caption or "").strip()
-    if not caption:
-        return await m.reply_text("Please send the image with the story name as the caption.")
-    if len(caption) > 1024:
-        return await m.reply_text("Story name/caption is too long. Telegram allows up to 1024 characters here.")
-    d = TEMP / jid
-    d.mkdir(exist_ok=True)
-    path = d / "start_post.jpg"
-    await tg_call(lambda: m.download(file_name=str(path)), jid, "start post image download")
-    jobs[jid]["start_post"] = {"image_path": str(path), "caption": caption, "sent": False}
-    sessions.pop((m.from_user.id, "startpost"), None)
-    await save()
-    await m.reply_text(
-        f"Start post saved successfully for Job {jid}.\nCaption: {caption}\n\n"
-        "When this job starts, Cleanfi will send this image to the target channel and pin it automatically.",
-        reply_markup=job_kb(jid)
-    )
-    m.stop_propagation()
-
-@app.on_message(filters.private & filters.command("batch"))
-async def batch_cmd(_, m):
-    if not allowed(m): return
-    if not settings.get("source") or not settings.get("target"):
-        return await m.reply_text("Set /source and /target first.")
-    jid = await create_batch_job(m.from_user.id, "", "")
-    sessions[(m.from_user.id, "batch_first")] = jid
-    await m.reply_text("Batch Mode\n\nSend me the first audio post link (e.g., https://t.me/channel/123).")
-
-@app.on_message(filters.private & filters.command("globalmeta"))
-async def globalmeta_cmd(_, m):
-    if not allowed(m): return
-    pairs = re.findall(r'(\w+)=(?:"([^"]*)"|\'([^\']*)\'|(\S+))', (m.text or "")[11:].strip())
-    if not pairs:
-        g = settings.get("global_meta", {})
-        return await m.reply_text("Global: " + json.dumps(g, ensure_ascii=False) + "\nUse /globalmeta artist=\"Name\" album_artist=\"Name\" album=\"Story\" genre=\"Romance\" year=2026")
-    g = settings.setdefault("global_meta", {})
-    for k,a,b,c in pairs:
-        if k in {"artist","genre","year","album","album_artist","comment"}: g[k] = a or b or c
-    await save()
-    await m.reply_text("Global metadata saved. New jobs will inherit these values.")
-
-@app.on_message(filters.private & filters.text)
-async def batch_link_input(_, m):
-    if not allowed(m): return
-    text = (m.text or "").strip()
-    if not text.startswith("https://t.me/"): return
-    jid = sessions.get((m.from_user.id, "batch_first")) or sessions.get((m.from_user.id, "batch_end"))
-    if not jid or jid not in jobs: return
-    if sessions.get((m.from_user.id, "batch_first")) == jid:
-        jobs[jid]["first_link"] = text
-        sessions.pop((m.from_user.id, "batch_first"), None)
-        sessions[(m.from_user.id, "batch_end")] = jid
-        await save()
-        return await m.reply_text("Batch Mode\n\nSend me the end audio post link (e.g., https://t.me/channel/123).")
-    jobs[jid]["end_link"] = text
-    sessions.pop((m.from_user.id, "batch_end"), None)
-    await save()
-    await m.reply_text("Batch configured. Press START to fetch all source messages and begin.", reply_markup=job_kb(jid))
-
-@app.on_message(filters.private & filters.command("meta"))
-async def meta_cmd(_, m):
-    if not allowed(m): return
-    jid = active(m)
-    if not jid: return await m.reply_text("Create a job first with /range.")
-    pairs = re.findall(r'(\w+)=(?:"([^"]*)"|\'([^\']*)\'|(\S+))', (m.text or "")[5:].strip())
-    if not pairs: return await m.reply_text('Example: /meta artist="Artist A" genre="Romance" year=2026 album="Book"')
-    for k, a, b, c in pairs:
-        if k in jobs[jid]["meta"]: jobs[jid]["meta"][k] = a or b or c
-    await save(); await m.reply_text(summary(jid), reply_markup=job_kb(jid))
-
-async def _save_global_cover(m):
-    if not allowed(m) or not sessions.get((m.from_user.id, "global_cover")):
-        return False
-    path = TEMP / "global_cover.jpg"
-    try:
-        await tg_call(lambda: m.download(file_name=str(path)), None, "global cover download")
-    except Exception as e:
-        log.exception("GLOBAL COVER DOWNLOAD FAILED user=%s", m.from_user.id)
-        await m.reply_text(f"Global cover download failed: {type(e).__name__}: {e}")
-        return True
-    sessions.pop((m.from_user.id, "global_cover"), None)
-    sessions[(m.from_user.id, "pending_global")] = ("cover_path", str(path))
-    log.info("GLOBAL COVER RECEIVED user=%s path=%s", m.from_user.id, path)
-    await m.reply_text("Global cover received.\n\nConfirm?", reply_markup=confirm_kb("global"))
-    return True
-
-@app.on_message(filters.private & filters.photo)
-async def cover_photo(_, m):
-    if await _save_global_cover(m):
-        return
-    if not allowed(m): return
+    log.info("COVER MEDIA RECEIVED user=%s type=%s global=%s job=%s active=%s", m.from_user.id, "photo" if m.photo else "document", bool(sessions.get((m.from_user.id, "global_cover"))), bool(sessions.get((m.from_user.id, "job_cover"))), sessions.get(m.from_user.id))
     if sessions.get((m.from_user.id, "startpost")):
+        return
+    if m.document and not (m.document.mime_type or "").startswith("image/"):
+        return
+    if sessions.get((m.from_user.id, "global_cover")):
+        path = TEMP / "global_cover.jpg"
+        try:
+            await tg_call(lambda: m.download(file_name=str(path)), None, "global cover download")
+            sessions.pop((m.from_user.id, "global_cover"), None)
+            sessions[(m.from_user.id, "pending_global")] = ("cover_path", str(path))
+            log.info("GLOBAL COVER RECEIVED user=%s path=%s", m.from_user.id, path)
+            await m.reply_text("Global cover received.\n\nConfirm?", reply_markup=confirm_kb("global"))
+        except Exception as e:
+            log.exception("GLOBAL COVER DOWNLOAD FAILED user=%s", m.from_user.id)
+            await m.reply_text(f"Global cover download failed: {type(e).__name__}: {e}")
         return
     jid = sessions.get(m.from_user.id) if sessions.get((m.from_user.id, "job_cover")) else active(m)
     if not jid or jid not in jobs:
-        return
-    d = TEMP / jid; d.mkdir(exist_ok=True); path = d / "cover.jpg"
+        return await m.reply_text("Create/select a job first, then use the Cover button.")
+    d = TEMP / jid
+    d.mkdir(exist_ok=True)
+    path = d / "cover.jpg"
     try:
         await tg_call(lambda: m.download(file_name=str(path)), jid, "job cover download")
         jobs[jid]["meta"]["cover_path"] = str(path)
@@ -538,31 +459,6 @@ async def cover_photo(_, m):
         await m.reply_text(f"Job {jid} cover saved successfully.", reply_markup=job_kb(jid))
     except Exception as e:
         log.exception("JOB COVER FAILED user=%s job=%s", m.from_user.id, jid)
-        await m.reply_text(f"Job cover save failed: {type(e).__name__}: {e}", reply_markup=job_kb(jid))
-
-@app.on_message(filters.private & filters.document)
-async def cover_document(_, m):
-    if not allowed(m): return
-    doc = m.document
-    if not doc or not (doc.mime_type or "").startswith("image/"):
-        return
-    if await _save_global_cover(m):
-        return
-    if sessions.get((m.from_user.id, "startpost")):
-        return
-    jid = sessions.get(m.from_user.id) if sessions.get((m.from_user.id, "job_cover")) else active(m)
-    if not jid or jid not in jobs: return
-    d = TEMP / jid; d.mkdir(exist_ok=True); path = d / "cover.jpg"
-    try:
-        await tg_call(lambda: m.download(file_name=str(path)), jid, "job cover document download")
-        jobs[jid]["meta"]["cover_path"] = str(path)
-        sessions.pop((m.from_user.id, "job_cover"), None)
-        sessions[m.from_user.id] = jid
-        await save()
-        log.info("JOB COVER DOCUMENT SAVED user=%s job=%s path=%s", m.from_user.id, jid, path)
-        await m.reply_text(f"Job {jid} cover saved successfully.", reply_markup=job_kb(jid))
-    except Exception as e:
-        log.exception("JOB COVER DOCUMENT FAILED user=%s job=%s", m.from_user.id, jid)
         await m.reply_text(f"Job cover save failed: {type(e).__name__}: {e}", reply_markup=job_kb(jid))
 
 @app.on_message(filters.private & filters.command("cover"))
