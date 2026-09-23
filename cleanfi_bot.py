@@ -34,6 +34,10 @@ flood_until = 0.0
 job_queue = None
 queue_task = None
 queued_jobs = set()
+# Deterministic FIFO order for queued jobs. The first waiting job is position 1,
+# the second waiting job is position 2, etc. (the currently running job is not
+# counted as a waiting position, but remains the active job ahead of the queue.)
+queue_order = []
 
 
 def save_sync():
@@ -533,6 +537,8 @@ async def cancel_cmd(_, m):
     j["cancel_requested"] = True
     if j.get("status") == "queued":
         queued_jobs.discard(jid)
+        if jid in queue_order:
+            queue_order.remove(jid)
         j["status"] = "cancelled"
         j["current"] = None
     else:
@@ -631,7 +637,7 @@ async def process_file_with_retry(jid, mid):
             await asyncio.sleep(min(30, 2 ** attempt))
 
 async def launch(jid, m, ids=None):
-    global job_queue, queue_task
+    global job_queue, queue_task, queue_order
     if not ids and jobs[jid].get("first_link") and jobs[jid].get("end_link"):
         ids = await fetch_batch_ids(jid)
     if jid in running or jid in queued_jobs:
@@ -647,17 +653,22 @@ async def launch(jid, m, ids=None):
     jobs[jid]["status"] = "queued"
     jobs[jid]["cancel_requested"] = False
     queued_jobs.add(jid)
+    queue_order.append(jid)
     await job_queue.put(jid)
     if queue_task is None or queue_task.done():
         queue_task = asyncio.create_task(queue_worker())
     await save()
-    position = list(queued_jobs).index(jid) + 1
+    # Never derive a queue position from a set: set iteration order is not FIFO.
+    # queue_order is the authoritative waiting order.
+    position = queue_order.index(jid) + 1
     await m.reply_text(f"Job {jid} queued. Queue position: {position}\nOnly one job runs at a time; the next job starts automatically after this job ends.")
 
 async def queue_worker():
     while True:
         jid = await job_queue.get()
         queued_jobs.discard(jid)
+        if jid in queue_order:
+            queue_order.remove(jid)
         if jid not in jobs:
             job_queue.task_done(); continue
         if jobs[jid].get("cancel_requested"):
