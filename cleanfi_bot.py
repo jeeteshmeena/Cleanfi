@@ -1004,6 +1004,7 @@ async def field_input(_, m):
     text = (m.text or "").strip()
     log.info("TEXT INPUT user=%s text=%s global_field=%s job_field=%s active=%s", m.from_user.id, text, sessions.get((m.from_user.id, "global_field")), sessions.get((m.from_user.id, "field")), sessions.get(m.from_user.id))
     if text.startswith("/"):
+        return
     # Handle the two-step Batch link flow before generic metadata input.
     if sessions.get((m.from_user.id, "batch_first")):
         if await handle_batch_link_input(m, text):
@@ -1012,7 +1013,7 @@ async def field_input(_, m):
         if not re.match(r"^https?://t\.me/(?:c/\d+/|[A-Za-z0-9_]+)/\d+(?:\?.*)?$", text):
             return await m.reply_text("Please send a valid Telegram message link.")
         await finalize_batch_job(m, sessions[(m.from_user.id, "batch_end")], text)
-        return return
+        return
     global_field = sessions.get((m.from_user.id, "global_field"))
     if global_field:
         if global_field in {"artist","album","album_artist","year","comment"}:
