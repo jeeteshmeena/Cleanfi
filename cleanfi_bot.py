@@ -956,12 +956,63 @@ async def callbacks(_, q: CallbackQuery):
         await q.answer()
         return await q.message.reply_text(f"Send {field.replace('_',' ')} value for Job {jid}.")
 
+async def handle_batch_link_input(m, text):
+    uid = m.from_user.id
+    jid = sessions.get((uid, "batch_first"))
+    if not jid or jid not in jobs:
+        return False
+    if not re.match(r"^https?://t\.me/(?:c/\d+/|[A-Za-z0-9_]+)/\d+(?:\?.*)?$", text):
+        await m.reply_text("Please send a valid Telegram message link, for example:\nhttps://t.me/channel/123")
+        return True
+    j = jobs[jid]
+    if not j.get("first_link"):
+        j["first_link"] = text
+        sessions[(uid, "batch_end")] = jid
+        sessions.pop((uid, "batch_first"), None)
+        await save()
+        await m.reply_text(f"First link saved for Job {jid}.\n\nNow send the last audio post link. No command or caption is required.")
+        return True
+    return False
+
+async def finalize_batch_job(m, jid, end_link):
+    j = jobs[jid]
+    j["end_link"] = end_link
+    sessions.pop((m.from_user.id, "batch_end"), None)
+    sessions.pop((m.from_user.id, "batch_first"), None)
+    try:
+        await m.reply_text(f"Reading the two Telegram posts for Job {jid}...")
+        ids = await fetch_batch_ids(jid)
+        if not ids:
+            raise ValueError("No message range found")
+        await save()
+        await m.reply_text(
+            f"Job {jid} configured successfully.\nFiles: {len(ids)}\n"
+            f"Source: {j['source']}\nTarget: {j['target']}\n\n"
+            "Global metadata has been copied to this job. Job-specific metadata can be changed before starting.",
+            reply_markup=job_kb(jid)
+        )
+    except Exception as e:
+        log.exception("BATCH LINK FINALIZE FAILED job=%s", jid)
+        j["status"] = "failed_queue"
+        j["failed_reasons"]["__setup__"] = f"{type(e).__name__}: {e}"
+        await save()
+        await m.reply_text(f"Could not read the Telegram message range for Job {jid}.\nError: {type(e).__name__}: {e}\n\nCheck Source and make sure both links belong to it.", reply_markup=main_kb())
+
 @app.on_message(filters.private, group=-90)
 async def field_input(_, m):
     if not allowed(m): return
     text = (m.text or "").strip()
     log.info("TEXT INPUT user=%s text=%s global_field=%s job_field=%s active=%s", m.from_user.id, text, sessions.get((m.from_user.id, "global_field")), sessions.get((m.from_user.id, "field")), sessions.get(m.from_user.id))
-    if text.startswith("/"): return
+    if text.startswith("/"):
+    # Handle the two-step Batch link flow before generic metadata input.
+    if sessions.get((m.from_user.id, "batch_first")):
+        if await handle_batch_link_input(m, text):
+            return
+    if sessions.get((m.from_user.id, "batch_end")):
+        if not re.match(r"^https?://t\.me/(?:c/\d+/|[A-Za-z0-9_]+)/\d+(?:\?.*)?$", text):
+            return await m.reply_text("Please send a valid Telegram message link.")
+        await finalize_batch_job(m, sessions[(m.from_user.id, "batch_end")], text)
+        return return
     global_field = sessions.get((m.from_user.id, "global_field"))
     if global_field:
         if global_field in {"artist","album","album_artist","year","comment"}:
