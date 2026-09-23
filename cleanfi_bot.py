@@ -61,7 +61,7 @@ def load():
     settings.setdefault("file_delay", DEFAULT_DELAY_SECONDS)
     settings["file_delay"] = min(MAX_DELAY_SECONDS, max(MIN_DELAY_SECONDS, int(settings["file_delay"])))
     settings.setdefault("min_free_gb", MIN_FREE_DISK_GB)
-    settings.setdefault("global_meta", {"artist": None, "genre": None, "year": None, "album": None, "album_artist": None, "comment": None})
+    settings.setdefault("global_meta", {"artist": None, "genre": None, "year": None, "album": None, "album_artist": None, "comment": None, "cover_path": g.get("cover_path")})
     for j in jobs.values():
         j.setdefault("source", settings["source"]); j.setdefault("target", settings["target"])
         j.setdefault("processed", []); j.setdefault("failed", []); j.setdefault("skipped", [])
@@ -172,34 +172,53 @@ def progress_text(jid):
             f"Speed: {speed:.1f} files/min\nElapsed: {int(elapsed//60)}m {int(elapsed%60)}s\n"
             f"ETA: {int(eta//60)}m {int(eta%60)}s\nFloodWait: {flood_text(jid)}")
 
-def custom_emoji(emoji_id):
-    return f"<tg-emoji emoji-id=\"{emoji_id}\">🙂</tg-emoji>"
+EMOJI = {
+    "artist": "5373334855612375386",
+    "cover": "5424885441100782420",
+    "new": "5375464961822695044",
+    "jobs": "5372926953978341366",
+    "source": "5471978009449731768",
+    "target": "5472105307985419058",
+    "status": "5370771949842602821",
+    "failed": "5370987174948774327",
+    "help": "5370738629486319646",
+    "delay": "5451732530048802485",
+    "start": "5373026167722876724",
+    "cancel": "5472309400536358507",
+    "genre": "5359441070201513074",
+}
 
-E = {"artist":5373334855612375386,"cover":5424892643760936970,"new":5373026167722876724,"jobs":5372926953978341366,
-     "source":5471978009449731768,"target":5472105307985419058,"status":5370771949842602821,"failed":5370987174948771923,
-     "help":5370738629486319646,"delay":5451732530041955576}
+def custom_emoji(emoji_id, alt):
+    return f'<tg-emoji emoji-id="{emoji_id}">{alt}</tg-emoji>'
 
 def main_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"{custom_emoji(E['artist'])} Set Artist", callback_data="m:artist"), InlineKeyboardButton(f"{custom_emoji(E['cover'])} Set Cover", callback_data="m:cover")],
-        [InlineKeyboardButton(f"{custom_emoji(E['new'])} New Job", callback_data="m:new"), InlineKeyboardButton(f"{custom_emoji(E['jobs'])} Jobs", callback_data="m:jobs")],
-        [InlineKeyboardButton(f"{custom_emoji(E['source'])} Set Source", callback_data="m:source"), InlineKeyboardButton(f"{custom_emoji(E['target'])} Set Target", callback_data="m:target")],
-        [InlineKeyboardButton(f"{custom_emoji(E['status'])} Status", callback_data="m:status"), InlineKeyboardButton(f"{custom_emoji(E['failed'])} Failed", callback_data="m:failed")],
-        [InlineKeyboardButton(f"{custom_emoji(E['help'])} Help", callback_data="m:help")],
-        [InlineKeyboardButton(f"{custom_emoji(E['delay'])} Delay", callback_data="m:delay")],
+        [InlineKeyboardButton("Set Artist", callback_data="m:artist", icon_custom_emoji_id=EMOJI["artist"]),
+         InlineKeyboardButton("Set Cover", callback_data="m:cover", icon_custom_emoji_id=EMOJI["cover"])],
+        [InlineKeyboardButton("New Job", callback_data="m:new", icon_custom_emoji_id=EMOJI["new"]),
+         InlineKeyboardButton("Jobs", callback_data="m:jobs", icon_custom_emoji_id=EMOJI["jobs"])],
+        [InlineKeyboardButton("Set Source", callback_data="m:source", icon_custom_emoji_id=EMOJI["source"]),
+         InlineKeyboardButton("Set Target", callback_data="m:target", icon_custom_emoji_id=EMOJI["target"])],
+        [InlineKeyboardButton("Status", callback_data="m:status", icon_custom_emoji_id=EMOJI["status"]),
+         InlineKeyboardButton("Failed", callback_data="m:failed", icon_custom_emoji_id=EMOJI["failed"])],
+        [InlineKeyboardButton("Help", callback_data="m:help", icon_custom_emoji_id=EMOJI["help"])],
+        [InlineKeyboardButton("Delay", callback_data="m:delay", icon_custom_emoji_id=EMOJI["delay"])],
     ])
 
 def job_kb(jid):
     m = jobs[jid]["meta"]
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"Artist: {m.get('artist') or '—'}", callback_data=f"s:artist:{jid}")],
-        [InlineKeyboardButton(f"Genre: {m.get('genre') or '—'}", callback_data=f"s:genre:{jid}"), InlineKeyboardButton("Choose", callback_data=f"genre:{jid}")],
-        [InlineKeyboardButton(f"Year: {m.get('year') or '—'}", callback_data=f"s:year:{jid}")],
-        [InlineKeyboardButton(f"Album: {m.get('album') or '—'}", callback_data=f"s:album:{jid}")],
-        [InlineKeyboardButton(f"Album Artist: {m.get('album_artist') or '—'}", callback_data=f"s:album_artist:{jid}")],
-        [InlineKeyboardButton(f"Comment: {m.get('comment') or '—'}", callback_data=f"s:comment:{jid}")],
-        [InlineKeyboardButton(f"Cover: {'Attached' if m.get('cover_path') else 'Not set'}", callback_data=f"cover:{jid}"), InlineKeyboardButton("Clear", callback_data=f"clear:{jid}")],
-        [InlineKeyboardButton("START", callback_data=f"start:{jid}"), InlineKeyboardButton("Cancel", callback_data=f"cancel:{jid}")],
+        [InlineKeyboardButton(f"Artist: {m.get('artist') or 'Not set'}", callback_data=f"s:artist:{jid}", icon_custom_emoji_id=EMOJI["artist"])],
+        [InlineKeyboardButton(f"Genre: {m.get('genre') or 'Not set'}", callback_data=f"s:genre:{jid}", icon_custom_emoji_id=EMOJI["genre"]),
+         InlineKeyboardButton("Choose", callback_data=f"genre:{jid}", icon_custom_emoji_id=EMOJI["genre"])],
+        [InlineKeyboardButton(f"Year: {m.get('year') or 'Not set'}", callback_data=f"s:year:{jid}")],
+        [InlineKeyboardButton(f"Album: {m.get('album') or 'Not set'}", callback_data=f"s:album:{jid}")],
+        [InlineKeyboardButton(f"Album Artist: {m.get('album_artist') or 'Not set'}", callback_data=f"s:album_artist:{jid}")],
+        [InlineKeyboardButton(f"Comment: {m.get('comment') or 'Not set'}", callback_data=f"s:comment:{jid}")],
+        [InlineKeyboardButton(f"Cover: {'Attached' if m.get('cover_path') else 'Not set'}", callback_data=f"cover:{jid}", icon_custom_emoji_id=EMOJI["cover"]),
+         InlineKeyboardButton("Clear", callback_data=f"clear:{jid}")],
+        [InlineKeyboardButton("START", callback_data=f"start:{jid}", icon_custom_emoji_id=EMOJI["start"]),
+         InlineKeyboardButton("Cancel", callback_data=f"cancel:{jid}", icon_custom_emoji_id=EMOJI["cancel"])],
     ])
 
 def summary(jid):
@@ -278,8 +297,8 @@ async def post_end(jid):
     await save()
 
 
-@app.on_message(filters.private & filters.text, group=-100)
-async def entry_fallback(_, m):
+@app.on_callback_query()
+async def callbacks(_, q: CallbackQuery):(_, m):
     text = (m.text or "").strip().split(maxsplit=1)[0].lower()
     if text not in ("/start", "/menu"):
         return
@@ -387,17 +406,6 @@ async def batch_cmd(_, m):
     sessions[(m.from_user.id, "batch_first")] = jid
     await m.reply_text("Batch Mode\n\nSend me the first audio post link (e.g., https://t.me/channel/123).")
 
-@app.on_message(filters.private & filters.command("range"))
-async def range_cmd(_, m):
-    if not allowed(m): return
-    p = (m.text or "").split()
-    if len(p) != 3 or not p[1].isdigit() or not p[2].isdigit() or int(p[1]) > int(p[2]):
-        return await m.reply_text("Usage: /range 1250 1300")
-    if not settings.get("source") or not settings.get("target"):
-        return await m.reply_text("Set /source and /target first.", reply_markup=main_kb())
-    jid = await create_job(m.from_user.id, int(p[1]), int(p[2]))
-    await m.reply_text(summary(jid), reply_markup=job_kb(jid))
-
 @app.on_message(filters.private & filters.command("globalmeta"))
 async def globalmeta_cmd(_, m):
     if not allowed(m): return
@@ -443,6 +451,13 @@ async def meta_cmd(_, m):
 @app.on_message(filters.private & filters.photo)
 async def cover_photo(_, m):
     if not allowed(m): return
+    if sessions.get((m.from_user.id, "global_cover")):
+        path = TEMP / "global_cover.jpg"
+        await tg_call(lambda: m.download(file_name=str(path)), None, "global cover download")
+        settings.setdefault("global_meta", {})["cover_path"] = str(path)
+        sessions.pop((m.from_user.id, "global_cover"), None)
+        await save()
+        return await m.reply_text("Global cover saved.", reply_markup=main_kb())
     if sessions.get((m.from_user.id, "startpost")):
         return
     p = (m.caption or "").split(); jid = p[1] if len(p) == 2 and p[0].lower() == "/cover" else active(m)
@@ -737,18 +752,37 @@ async def run_job(jid, ids=None):
                 pass
 
 async def callbacks(_, q: CallbackQuery):
-    if not q.from_user or q.from_user.id not in ADMINS: return await q.answer("Not authorized", show_alert=True)
+    if not q.from_user or q.from_user.id not in ADMINS:
+        return await q.answer("Not authorized", show_alert=True)
     parts = q.data.split(":"); action = parts[0]
+
     if action == "m":
         sub = parts[1]
-        if sub == "new": await q.answer(); return await q.message.reply_text("Use /batch to create a batch.")
-        if sub == "jobs": await q.answer(); return await q.message.reply_text("Use /jobs for recent jobs.")
-        if sub == "source": await q.answer("Use /source @channelusername", show_alert=True); return
-        if sub == "target": await q.answer("Use /target @channelusername", show_alert=True); return
-        if sub == "status": await q.answer("Use /status JOB_ID", show_alert=True); return
-        if sub == "failed": await q.answer("Use /failed JOB_ID", show_alert=True); return
-        if sub == "delay": await q.answer("Use /delay 3 to /delay 60", show_alert=True); return
-        if sub == "help": await q.answer(); return await q.message.reply_text("Use /help for all commands.")
+        await q.answer()
+        if sub == "new":
+            jid = await create_batch_job(q.from_user.id, "", "")
+            sessions[(q.from_user.id, "batch_first")] = jid
+            return await q.message.reply_text("Batch Mode\n\nSend me the first audio post link (e.g., https://t.me/channel/123).")
+        if sub == "jobs":
+            rows = [f"{x} - {j['status']} - {len(j['processed'])}/{j['total']}" for x,j in list(jobs.items())[-20:]]
+            return await q.message.reply_text("JOBS\n\n" + ("\n".join(rows) or "No jobs."), reply_markup=main_kb())
+        if sub in {"artist", "source", "target", "delay"}:
+            sessions[q.from_user.id] = None
+            sessions[(q.from_user.id, "global_field")] = sub
+            prompts = {"artist":"Send global artist name.", "source":"Send source channel username or ID.", "target":"Send target channel username or ID.", "delay":"Send delay in seconds (3-60)."}
+            return await q.message.reply_text(prompts[sub])
+        if sub == "cover":
+            sessions[(q.from_user.id, "global_cover")] = True
+            return await q.message.reply_text("Send the cover image now.")
+        if sub == "status":
+            sessions[(q.from_user.id, "global_field")] = "status"
+            return await q.message.reply_text("Send the Job ID.")
+        if sub == "failed":
+            sessions[(q.from_user.id, "global_field")] = "failed"
+            return await q.message.reply_text("Send the Job ID.")
+        if sub == "help":
+            return await q.message.reply_text("Use /batch to create a Batch job. Set Source and Target from the menu. Set Artist and Cover are global defaults. Delay controls the seconds between files.")
+
     jid = parts[-1]
     if jid not in jobs: return await q.answer("Unknown job", show_alert=True)
     if action == "start": await q.answer(); return await launch(jid, q.message)
@@ -783,11 +817,49 @@ async def callbacks(_, q: CallbackQuery):
 @app.on_message(filters.private & filters.text)
 async def field_input(_, m):
     if not allowed(m): return
+    text = (m.text or "").strip()
+    if text.startswith("/"): return
+    global_field = sessions.get((m.from_user.id, "global_field"))
+    if global_field:
+        if global_field == "artist":
+            settings.setdefault("global_meta", {})["artist"] = text
+            await save()
+            sessions.pop((m.from_user.id, "global_field"), None)
+            return await m.reply_text("Global artist saved.", reply_markup=main_kb())
+        if global_field in {"source", "target"}:
+            try:
+                c = await resolve_chat(text)
+                settings[global_field] = str(c.id)
+                await save()
+                sessions.pop((m.from_user.id, "global_field"), None)
+                return await m.reply_text(f"{global_field.title()} saved.\n{c.title or c.first_name}\nID: {c.id}", reply_markup=main_kb())
+            except Exception as e:
+                return await m.reply_text(f"Could not set {global_field}: {type(e).__name__}: {e}")
+        if global_field == "delay":
+            if not text.isdigit() or not (MIN_DELAY_SECONDS <= int(text) <= MAX_DELAY_SECONDS):
+                return await m.reply_text(f"Delay must be between {MIN_DELAY_SECONDS} and {MAX_DELAY_SECONDS} seconds.")
+            settings["file_delay"] = int(text)
+            await save()
+            sessions.pop((m.from_user.id, "global_field"), None)
+            return await m.reply_text(f"Delay set to {text} seconds.", reply_markup=main_kb())
+        if global_field in {"status", "failed"}:
+            jid = text
+            sessions.pop((m.from_user.id, "global_field"), None)
+            if jid not in jobs:
+                return await m.reply_text("Unknown Job ID.", reply_markup=main_kb())
+            if global_field == "status":
+                return await m.reply_text(summary(jid), reply_markup=job_kb(jid))
+            j = jobs[jid]
+            failed = "\n".join(f"{i} - {j['failed_reasons'].get(str(i),'unknown')}" for i in j["failed"])
+            return await m.reply_text("FAILED\n\n" + (failed or "No failed files."), reply_markup=main_kb())
+
     field = sessions.get((m.from_user.id, "field")); jid = active(m)
-    if not field or jid not in jobs or (m.text or "").startswith("/"): return
+    if not field or jid not in jobs: return
     if field in {"artist","genre","year","album","album_artist","comment"}:
-        jobs[jid]["meta"][field] = m.text.strip(); sessions.pop((m.from_user.id, "field"), None)
-        await save(); await m.reply_text(summary(jid), reply_markup=job_kb(jid))
+        jobs[jid]["meta"][field] = text
+        sessions.pop((m.from_user.id, "field"), None)
+        await save()
+        await m.reply_text(summary(jid), reply_markup=job_kb(jid))
 
 def main():
     load()
