@@ -479,10 +479,9 @@ async def cover_photo(_, m):
     if sessions.get((m.from_user.id, "global_cover")):
         path = TEMP / "global_cover.jpg"
         await tg_call(lambda: m.download(file_name=str(path)), None, "global cover download")
-        settings.setdefault("global_meta", {})["cover_path"] = str(path)
         sessions.pop((m.from_user.id, "global_cover"), None)
-        await save()
-        return await m.reply_text("Global cover saved.", reply_markup=main_kb())
+        sessions[(m.from_user.id, "pending_global")] = ("cover_path", str(path))
+        return await m.reply_text("Global cover received.\n\nConfirm?", reply_markup=confirm_kb("global"))
     if sessions.get((m.from_user.id, "startpost")):
         return
     p = (m.caption or "").split(); jid = p[1] if len(p) == 2 and p[0].lower() == "/cover" else active(m)
