@@ -1002,7 +1002,7 @@ async def callbacks(_, q: CallbackQuery):
         await q.answer()
         return await q.message.reply_text(f"Send {field.replace('_',' ')} value for Job {jid}.")
 
-@app.on_message(filters.private & filters.text)
+@app.on_message(filters.private, group=-90)
 async def field_input(_, m):
     if not allowed(m): return
     text = (m.text or "").strip()
