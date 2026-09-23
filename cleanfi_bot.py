@@ -142,40 +142,7 @@ async def resolve_chat(value):
     value = str(value).strip()
     return await tg_call(lambda: app.get_chat(int(value) if re.fullmatch(r"-?\d+", value) else value), label="get_chat")
 
-ACTIVITY_EMOJI = {
-    "Downloading": ("5433811242135331842", "📥"),
-    "Cleaning metadata": ("5472386005573049567", "🧼"),
-    "Uploading": ("5433614747381538714", "📤"),
-}
-
-async def activity(jid, stage, detail=""):
-    j = jobs[jid]
-    emoji_id, alt = ACTIVITY_EMOJI.get(stage, (EMOJI["status"], "📊"))
-    text = f'<tg-emoji emoji-id="{emoji_id}">{alt}</tg-emoji> <b>{stage}…</b>\nJob: <code>{jid}</code>'
-    if detail:
-        text += "\n" + detail
-    try:
-        mid = j.get("activity_message_id")
-        if mid:
-            await tg_call(lambda: app.edit_message_text(j["owner"], mid, text), jid, "activity")
-        else:
-            msg = await tg_call(lambda: app.send_message(j["owner"], text), jid, "activity")
-            j["activity_message_id"] = msg.id
-    except Exception:
-        pass
-
-async def clear_activity(jid):
-    j = jobs.get(jid)
-    mid = j.get("activity_message_id") if j else None
-    if not mid:
-        return
-    try:
-        await tg_call(lambda: app.delete_messages(j["owner"], mid), jid, "activity delete")
-    except Exception:
-        pass
-    j["activity_message_id"] = None
-
-async def safe_progress(jid, force=False):
+async def safe_progress(jid, force=False):(jid, force=False):
     j = jobs[jid]; now = time.time()
     if not force and now - j.get("last_progress", 0) < 2:
         return
