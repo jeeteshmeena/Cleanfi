@@ -200,20 +200,26 @@ def ib(text, data, emoji=None, style=ButtonStyle.PRIMARY):
         kw["icon_custom_emoji_id"] = EMOJI[emoji]
     return InlineKeyboardButton(text, **kw)
 
+def global_meta_kb():
+    return InlineKeyboardMarkup([
+        [ib("Artist", "gm:artist", "artist", ButtonStyle.PRIMARY),
+         ib("Album", "gm:album", "genre", ButtonStyle.PRIMARY)],
+        [ib("Album Artist", "gm:album_artist", "artist", ButtonStyle.PRIMARY),
+         ib("Genre", "gm:genre", "genre", ButtonStyle.PRIMARY)],
+        [ib("Year", "gm:year", "status", ButtonStyle.PRIMARY),
+         ib("Comment", "gm:comment", "help", ButtonStyle.PRIMARY)],
+        [ib("Cover", "gm:cover", "cover", ButtonStyle.PRIMARY)],
+        [ib("Back", "gm:back", "cancel", ButtonStyle.DANGER)],
+    ])
+
 def main_kb():
     return InlineKeyboardMarkup([
-        [ib("Artist", "m:artist", "artist", ButtonStyle.PRIMARY),
-         ib("Cover", "m:cover", "cover", ButtonStyle.PRIMARY)],
-        [ib("Album", "m:album", "genre", ButtonStyle.PRIMARY),
-         ib("Album Artist", "m:album_artist", "artist", ButtonStyle.PRIMARY)],
-        [ib("Genre", "m:genre", "genre", ButtonStyle.PRIMARY),
-         ib("Year", "m:year", "status", ButtonStyle.PRIMARY)],
-        [ib("Comment", "m:comment", "help", ButtonStyle.PRIMARY),
-         ib("Delay", "m:delay", "delay", ButtonStyle.PRIMARY)],
-        [ib("Source", "m:source", "source", ButtonStyle.PRIMARY),
-         ib("Target", "m:target", "target", ButtonStyle.PRIMARY)],
-        [ib("New Job", "m:new", "new", ButtonStyle.SUCCESS),
-         ib("Jobs", "m:jobs", "jobs", ButtonStyle.PRIMARY)],
+        [ib("Global Metadata", "m:metadata", "genre", ButtonStyle.PRIMARY)],
+        [ib("Set Source", "m:source", "source", ButtonStyle.PRIMARY),
+         ib("Set Target", "m:target", "target", ButtonStyle.PRIMARY)],
+        [ib("Delay", "m:delay", "delay", ButtonStyle.PRIMARY),
+         ib("New Job", "m:new", "new", ButtonStyle.SUCCESS)],
+        [ib("Jobs", "m:jobs", "jobs", ButtonStyle.PRIMARY)],
         [ib("Status", "m:status", "status", ButtonStyle.PRIMARY),
          ib("Failed", "m:failed", "failed", ButtonStyle.DANGER)],
         [ib("Help", "m:help", "help", ButtonStyle.PRIMARY)],
@@ -809,6 +815,8 @@ async def callbacks(_, q: CallbackQuery):
     if action == "m":
         sub = parts[1]
         await q.answer()
+        if sub == "metadata":
+            return await q.message.edit_text("Global Metadata\n\nSet defaults used automatically by every new job.", reply_markup=global_meta_kb())
         if sub == "new":
             jid = await create_batch_job(q.from_user.id, "", "")
             sessions[(q.from_user.id, "batch_first")] = jid
@@ -816,7 +824,7 @@ async def callbacks(_, q: CallbackQuery):
         if sub == "jobs":
             rows = [f"{x} - {j['status']} - {len(j['processed'])}/{j['total']}" for x,j in list(jobs.items())[-20:]]
             return await q.message.reply_text("JOBS\n\n" + ("\n".join(rows) or "No jobs."), reply_markup=main_kb())
-        if sub in {"artist","album","album_artist","genre","year","comment","source","target","delay"}:
+        if sub in {"source","target","delay"}:
             sessions[q.from_user.id] = None
             sessions[(q.from_user.id, "global_field")] = sub
             prompts = {
@@ -852,8 +860,11 @@ async def callbacks(_, q: CallbackQuery):
         if sub == "back":
             await q.answer()
             return await q.message.edit_text("Welcome to Cleanfi", reply_markup=main_kb())
+        if sub == "cover":
+            sessions[(q.from_user.id, "global_cover")] = True
+            await q.answer()
+            return await q.message.reply_text("Send the global cover image now.")
         if sub in {"artist","album","album_artist","genre","year","comment"}:
-            sessions[q.from_user.id] = None
             sessions[(q.from_user.id, "global_field")] = sub
             if sub == "genre":
                 rows = [[ib(x, f"gg:{i}", "genre", ButtonStyle.PRIMARY)] for i,x in enumerate(GENRE_OPTIONS)]
@@ -862,6 +873,8 @@ async def callbacks(_, q: CallbackQuery):
                 return await q.message.reply_text("Choose global genre:", reply_markup=InlineKeyboardMarkup(rows))
             await q.answer()
             return await q.message.reply_text(f"Send global {sub.replace('_',' ')}.")
+        return await q.answer("Unknown setting", show_alert=True)
+
     if action == "gg":
         value = parts[1]
         if value == "custom":
@@ -881,23 +894,37 @@ async def callbacks(_, q: CallbackQuery):
         if kind == "global":
             pending = sessions.pop((q.from_user.id, "pending_global"), None)
             if not pending:
-                await q.answer("Nothing pending", show_alert=True)
-                return
-            field = pending[0]
-            if field in {"source", "target"}:
-                settings[field] = pending[1]
+                return await q.answer("Nothing pending", show_alert=True)
+            field, value = pending[0], pending[1]
+            if field in {"source","target"}:
+                settings[field] = value
             elif field == "delay":
-                settings["file_delay"] = int(pending[1])
+                settings["file_delay"] = int(value)
             else:
-                settings.setdefault("global_meta", {})[field] = pending[1]
+                settings.setdefault("global_meta", {})[field] = value
             await save()
-            log.info("GLOBAL SET user=%s field=%s value=%s", q.from_user.id, field, pending[1])
+            log.info("GLOBAL SET user=%s field=%s value=%s", q.from_user.id, field, value)
             await q.answer("Saved")
-            return await q.message.reply_text("Global setting saved successfully.", reply_markup=main_kb())
+            return await q.message.edit_text(f"Global {field.replace('_',' ')} saved:\n\n{value}", reply_markup=global_meta_kb() if field in {"artist","album","album_artist","genre","year","comment"} else main_kb())
+        if kind == "job":
+            pending = sessions.pop((q.from_user.id, "pending_job"), None)
+            if not pending:
+                return await q.answer("Nothing pending", show_alert=True)
+            jid, field, value = pending
+            if jid not in jobs:
+                return await q.answer("Job no longer exists", show_alert=True)
+            jobs[jid]["meta"][field] = value
+            await save()
+            log.info("JOB SET user=%s job=%s field=%s value=%s", q.from_user.id, jid, field, value)
+            await q.answer("Saved")
+            return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
         await q.answer("Confirmed")
         return await q.message.reply_text(f"{kind.title()} confirmed.", reply_markup=main_kb())
     if action == "cancel_confirm":
         sessions.pop((q.from_user.id, "pending_global"), None)
+        sessions.pop((q.from_user.id, "pending_job"), None)
+        sessions.pop((q.from_user.id, "global_field"), None)
+        sessions.pop((q.from_user.id, "field"), None)
         await q.answer("Cancelled")
         return await q.message.reply_text("Cancelled. No changes were saved.", reply_markup=main_kb())
 
@@ -967,13 +994,19 @@ async def callbacks(_, q: CallbackQuery):
         await q.answer()
         return await q.message.reply_text("Send custom genre.")
     if action == "s":
-        field = parts[1]; sessions[q.from_user.id] = jid; sessions[(q.from_user.id, "field")] = field
-        await q.answer(); return await q.message.reply_text(f"Send {field} value as the next message.")
+        field = parts[1]
+        if field not in {"artist","genre","year","album","album_artist","comment"}:
+            return await q.answer("Invalid metadata field", show_alert=True)
+        sessions[q.from_user.id] = jid
+        sessions[(q.from_user.id, "field")] = field
+        await q.answer()
+        return await q.message.reply_text(f"Send {field.replace('_',' ')} value for Job {jid}.")
 
 @app.on_message(filters.private & filters.text)
 async def field_input(_, m):
     if not allowed(m): return
     text = (m.text or "").strip()
+    log.info("TEXT INPUT user=%s text=%s global_field=%s job_field=%s active=%s", m.from_user.id, text, sessions.get((m.from_user.id, "global_field")), sessions.get((m.from_user.id, "field")), sessions.get(m.from_user.id))
     if text.startswith("/"): return
     global_field = sessions.get((m.from_user.id, "global_field"))
     if global_field:
@@ -1012,13 +1045,15 @@ async def field_input(_, m):
             failed = "\n".join(f"{i} - {j['failed_reasons'].get(str(i),'unknown')}" for i in j["failed"])
             return await m.reply_text("FAILED\n\n" + (failed or "No failed files."), reply_markup=main_kb())
 
-    field = sessions.get((m.from_user.id, "field")); jid = active(m)
-    if not field or jid not in jobs: return
+    field = sessions.get((m.from_user.id, "field")); jid = sessions.get(m.from_user.id) or active(m)
+    if not field or not jid or jid not in jobs: return
     if field in {"artist","genre","year","album","album_artist","comment"}:
-        jobs[jid]["meta"][field] = text
+        sessions[(m.from_user.id, "pending_job")] = (jid, field, text)
         sessions.pop((m.from_user.id, "field"), None)
-        await save()
-        await m.reply_text(summary(jid), reply_markup=job_kb(jid))
+        return await m.reply_text(
+            f"Set {field.replace('_',' ')} for Job {jid} to:\n{text}\n\nConfirm?",
+            reply_markup=confirm_kb("job")
+        )
 
 def main():
     load()
