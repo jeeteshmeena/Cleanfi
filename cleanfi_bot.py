@@ -1,5 +1,6 @@
 import os, re, json, asyncio, time, uuid, logging
 from pathlib import Path
+import shutil
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.enums import ButtonStyle
@@ -38,6 +39,7 @@ queued_jobs = set()
 # the second waiting job is position 2, etc. (the currently running job is not
 # counted as a waiting position, but remains the active job ahead of the queue.)
 queue_order = []
+job_tasks = {}
 
 
 def save_sync():
@@ -78,6 +80,7 @@ def load():
         if j.get("status") in {"running", "queued", "cancelling"}:
             j["status"] = "paused"
         j.setdefault("retries", 0)
+        j.setdefault("stats", {"files_sent": len(j.get("processed", [])), "bytes_downloaded": 0, "bytes_uploaded": 0, "started_at": j.get("started_at"), "finished_at": None})
 
 def allowed(m):
     return bool(m.from_user and m.from_user.id in ADMINS)
@@ -138,6 +141,32 @@ async def tg_call(fn, jid=None, label="Telegram"):
 async def resolve_chat(value):
     value = str(value).strip()
     return await tg_call(lambda: app.get_chat(int(value) if re.fullmatch(r"-?\d+", value) else value), label="get_chat")
+
+async def activity(jid, stage, detail=""):
+    j = jobs[jid]
+    text = f'<tg-emoji emoji-id="{EMOJI["new"]}">✦</tg-emoji> <b>{stage}</b>\nJob: <code>{jid}</code>'
+    if detail:
+        text += "\n" + detail
+    try:
+        mid = j.get("activity_message_id")
+        if mid:
+            await tg_call(lambda: app.edit_message_text(j["owner"], mid, text), jid, "activity")
+        else:
+            msg = await tg_call(lambda: app.send_message(j["owner"], text), jid, "activity")
+            j["activity_message_id"] = msg.id
+    except Exception:
+        pass
+
+async def clear_activity(jid):
+    j = jobs.get(jid)
+    mid = j.get("activity_message_id") if j else None
+    if not mid:
+        return
+    try:
+        await tg_call(lambda: app.delete_messages(j["owner"], mid), jid, "activity delete")
+    except Exception:
+        pass
+    j["activity_message_id"] = None
 
 async def safe_progress(jid, force=False):
     j = jobs[jid]; now = time.time()
@@ -227,7 +256,7 @@ def main_kb():
          ib("Set Target", "m:target", "target", ButtonStyle.PRIMARY)],
         [ib("Delay", "m:delay", "delay", ButtonStyle.PRIMARY),
          ib("New Job", "m:new", "new", ButtonStyle.SUCCESS)],
-        [ib("Jobs", "m:jobs", "jobs", ButtonStyle.PRIMARY)],
+        [ib("Jobs", "m:jobs", "jobs", ButtonStyle.PRIMARY), ib("Stats", "m:stats", "status", ButtonStyle.PRIMARY)],
         [ib("Status", "m:status", "status", ButtonStyle.PRIMARY),
          ib("Failed", "m:failed", "failed", ButtonStyle.DANGER)],
         [ib("Help", "m:help", "help", ButtonStyle.PRIMARY)],
@@ -266,6 +295,14 @@ def summary(jid):
             f"Comment: {m.get('comment') or '—'}\nCover: {'Attached' if m.get('cover_path') else 'Not attached'}\n"
             f"Title: Original source title\nDelay: {get_delay(jid)}s between episodes\n\nProcessed: {len(j['processed'])}/{j['total']} | Failed: {len(j['failed'])} | Skipped: {len(j['skipped'])}")
 
+async def snapshot_job_cover(jid):
+    src = settings.get("global_meta", {}).get("cover_path")
+    if src and Path(src).is_file():
+        dest = TEMP / jid / "cover.jpg"
+        dest.parent.mkdir(exist_ok=True)
+        shutil.copy2(src, dest)
+        jobs[jid]["meta"]["cover_path"] = str(dest)
+
 async def create_batch_job(owner, first_link, end_link):
     jid = uuid.uuid4().hex[:8]
     jobs[jid] = {"id": jid, "owner": owner, "first_link": first_link, "end_link": end_link, "start": None, "end": None,
@@ -273,7 +310,9 @@ async def create_batch_job(owner, first_link, end_link):
                  "cancel_requested": False, "meta": newmeta(), "source": settings["source"], "target": settings["target"],
                  "created": time.time(), "started_at": None, "progress_message_id": None, "current": None,
                  "flood_until": 0, "queue_ids": None, "delay_seconds": int(settings.get("file_delay", DEFAULT_DELAY_SECONDS)),
-                 "start_post": {"image_path": None, "caption": None, "sent": False}, "end_post_sent": False}
+                 "start_post": {"image_path": None, "caption": None, "sent": False}, "end_post_sent": False,
+                  "stats": {"files_sent": 0, "bytes_downloaded": 0, "bytes_uploaded": 0, "started_at": None, "finished_at": None}}
+    await snapshot_job_cover(jid)
     sessions[owner] = jid
     await save()
     return jid
@@ -300,6 +339,7 @@ async def create_job(owner, start, end):
                  "delay_seconds": int(settings.get("file_delay", DEFAULT_DELAY_SECONDS)),
                  "start_post": {"image_path": None, "caption": None, "sent": False},
                  "end_post_sent": False}
+    await snapshot_job_cover(jid)
     sessions[owner] = jid
     await save()
     return jid
@@ -544,6 +584,9 @@ async def cancel_cmd(_, m):
     else:
         j["status"] = "cancelling"
     await save()
+    task = job_tasks.get(jid)
+    if task and not task.done():
+        task.cancel()
     log.info("CANCEL command user=%s job=%s status=%s", m.from_user.id, jid, j["status"])
     await m.reply_text(f"Cancellation requested for Job {jid}. The current operation will finish safely, then the job will stop.", reply_markup=job_kb(jid))
 
@@ -582,6 +625,8 @@ async def download_media_direct(media, path, jid):
             written += len(chunk)
     if written <= 0:
         raise RuntimeError("Telegram returned an empty media download")
+    if jid and jobs.get(jid):
+        jobs[jid].setdefault("stats", {})["bytes_downloaded"] = jobs[jid].get("stats", {}).get("bytes_downloaded", 0) + written
     return path
 
 async def process_file(jid, mid):
@@ -599,7 +644,9 @@ async def process_file(jid, mid):
     d = TEMP / jid; d.mkdir(exist_ok=True)
     inp = d / f"{mid}_{Path(name).name}"; out = d / f"out_{mid}_{Path(name).name}"
     try:
+        await activity(jid, "Downloading", f"File <code>#{mid}</code>")
         await download_media_direct(media, str(inp), jid)
+        await activity(jid, "Cleaning metadata", f"File <code>#{mid}</code>")
         title = read_original_title(str(inp))
         if title is None:
             try:
@@ -610,13 +657,18 @@ async def process_file(jid, mid):
             artist=j["meta"].get("artist"), genre=j["meta"].get("genre"), year=j["meta"].get("year"),
             cover=j["meta"].get("cover_path"), album=j["meta"].get("album"),
             album_artist=j["meta"].get("album_artist"), comment=j["meta"].get("comment"))
+        await activity(jid, "Uploading", f"File <code>#{mid}</code>")
+        upload_bytes = out.stat().st_size if out.exists() else 0
         kw = {"audio": str(out), "caption": msg.caption or "", "file_name": name, "title": str(title)}
         if j["meta"].get("artist"): kw["performer"] = str(j["meta"]["artist"])
         cp = j["meta"].get("cover_path")
         if cp and Path(cp).is_file(): kw["thumb"] = cp
         await tg_call(lambda: app.send_audio(int(j["target"]), **kw), jid, "upload")
+        j.setdefault("stats", {})["files_sent"] = j.get("stats", {}).get("files_sent", 0) + 1
+        j["stats"]["bytes_uploaded"] = j.get("stats", {}).get("bytes_uploaded", 0) + upload_bytes
         return "ok", None
     finally:
+        await clear_activity(jid)
         for p in (inp, out):
             try: p.unlink()
             except FileNotFoundError: pass
@@ -676,7 +728,12 @@ async def queue_worker():
             await save(); job_queue.task_done(); continue
         try:
             running[jid] = True
-            await run_job(jid, jobs[jid]["queue_ids"])
+            task = asyncio.create_task(run_job(jid, jobs[jid]["queue_ids"]))
+            job_tasks[jid] = task
+            try:
+                await task
+            finally:
+                job_tasks.pop(jid, None)
         except Exception as e:
             j = jobs.get(jid)
             if j:
@@ -698,6 +755,8 @@ async def run_job(jid, ids=None):
     j["started_at"] = j.get("started_at") or time.time()
     j["flood_until"] = 0
     j["flood_label"] = None
+    j.setdefault("stats", {})["started_at"] = j["started_at"]
+    j["stats"]["finished_at"] = None
     await save()
     ids = ids if ids is not None else list(range(j["start"], j["end"] + 1))
     completed = set(j["processed"]) | set(j["skipped"])
@@ -780,17 +839,30 @@ async def run_job(jid, ids=None):
         else:
             j["status"] = "completed"
 
+    except asyncio.CancelledError:
+        j["cancel_requested"] = True
+        j["status"] = "cancelled"
+        log.info("JOB CANCELLED IMMEDIATELY job=%s", jid)
     finally:
         j["current"] = None
+        j.setdefault("stats", {})["finished_at"] = time.time()
+        await clear_activity(jid)
         await save()
         await safe_progress(jid, True)
-        try:
-            await post_end(jid)
-        except Exception:
-            log.exception("End post failed for job %s", jid)
         if j.get("status") in {"completed", "completed_with_failures"}:
             try:
-                await app.send_message(j["owner"], f"Job {jid} finished with status: {j['status']}.")
+                await post_end(jid)
+            except Exception:
+                log.exception("End post failed for job %s", jid)
+            s = j["stats"]
+            elapsed = max(0, s.get("finished_at", time.time()) - (s.get("started_at") or time.time()))
+            try:
+                await app.send_message(j["owner"], f"Job {jid} completed.\n\nFiles sent: {s.get('files_sent', 0)}\nData uploaded: {s.get('bytes_uploaded', 0)/(1024**2):.2f} MB\nFailed: {len(j['failed'])}\nSkipped: {len(j['skipped'])}\nTotal time: {int(elapsed//60)}m {int(elapsed%60)}s")
+            except Exception:
+                pass
+        elif j.get("status") == "cancelled":
+            try:
+                await app.send_message(j["owner"], f"Job {jid} was cancelled.\n\nFiles sent: {j['stats'].get('files_sent', 0)}\nData uploaded: {j['stats'].get('bytes_uploaded', 0)/(1024**2):.2f} MB")
             except Exception:
                 pass
 
@@ -813,6 +885,12 @@ async def callbacks(_, q: CallbackQuery):
         if sub == "jobs":
             rows = [f"{x} - {j['status']} - {len(j['processed'])}/{j['total']}" for x,j in list(jobs.items())[-20:]]
             return await q.message.reply_text("JOBS\n\n" + ("\n".join(rows) or "No jobs."), reply_markup=main_kb())
+        if sub == "stats":
+            total_sent = sum(j.get("stats", {}).get("files_sent", len(j.get("processed", []))) for j in jobs.values())
+            total_mb = sum(j.get("stats", {}).get("bytes_uploaded", 0) for j in jobs.values()) / (1024**2)
+            total_failed = sum(len(j.get("failed", [])) for j in jobs.values())
+            total_skipped = sum(len(j.get("skipped", [])) for j in jobs.values())
+            return await q.message.reply_text(f"Stats\n\nFiles sent: {total_sent}\nData uploaded: {total_mb:.2f} MB\nFailed files: {total_failed}\nSkipped files: {total_skipped}\nJobs: {len(jobs)}", reply_markup=main_kb())
         if sub in {"source","target","delay"}:
             sessions[q.from_user.id] = None
             sessions[(q.from_user.id, "global_field")] = sub
@@ -949,6 +1027,7 @@ async def callbacks(_, q: CallbackQuery):
         j["cancel_requested"] = True
         if j.get("status") == "queued":
             queued_jobs.discard(jid)
+            if jid in queue_order: queue_order.remove(jid)
             j["status"] = "cancelled"
             j["current"] = None
         else:
