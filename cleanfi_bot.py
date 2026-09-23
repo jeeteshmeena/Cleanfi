@@ -636,11 +636,12 @@ async def queue_worker():
 
 async def run_job(jid, ids=None):
     j = jobs[jid]
-    j["status"] = "running"; j["started_at"] = j.get("started_at") or time.time()
+    j["status"] = "running"
+    j["started_at"] = j.get("started_at") or time.time()
     j["flood_until"] = 0
     j["flood_label"] = None
     await save()
-    ids = ids if ids is not None else list(range(j["start"], j["end"]+1))
+    ids = ids if ids is not None else list(range(j["start"], j["end"] + 1))
     completed = set(j["processed"]) | set(j["skipped"])
     ids = [i for i in ids if i not in completed]
     await safe_progress(jid, True)
@@ -654,9 +655,15 @@ async def run_job(jid, ids=None):
                     await app.send_message(j["owner"], f"Start post failed for job {jid}: {type(e).__name__}: {e}\nThe file task will continue.")
                 except Exception:
                     pass
+
         for mid in ids:
-            if j.get("cancel_requested"): break
-            j["current"] = mid; await safe_progress(jid, True)
+            if j.get("cancel_requested"):
+                break
+            j["current"] = mid
+            await safe_progress(jid, True)
+
+            result = None
+            reason = None
             try:
                 while True:
                     try:
@@ -669,7 +676,7 @@ async def run_job(jid, ids=None):
                         j["flood_label"] = "Telegram FloodWait"
                         await save()
                         await safe_progress(jid, True)
-                        log.warning("FloodWait on job %s for %ss; pausing job and retrying message %s after wait", jid, seconds, mid)
+                        log.warning("FloodWait on job %s for %ss; pausing and retrying message %s", jid, seconds, mid)
                         try:
                             await app.send_message(
                                 j["owner"],
@@ -683,42 +690,52 @@ async def run_job(jid, ids=None):
                         j["status"] = "running"
                         await save()
                         await safe_progress(jid, True)
+
                 if result == "ok":
-                    if mid not in j["processed"]: j["processed"].append(mid)
+                    if mid not in j["processed"]:
+                        j["processed"].append(mid)
                 elif result == "skip":
-                    if mid not in j["skipped"]: j["skipped"].append(mid)
+                    if mid not in j["skipped"]:
+                        j["skipped"].append(mid)
                 else:
-                    if mid not in j["failed"]: j["failed"].append(mid)
+                    if mid not in j["failed"]:
+                        j["failed"].append(mid)
                     j["failed_reasons"][str(mid)] = reason or "unknown"
+
             except Exception as e:
-                if mid not in j["failed"]: j["failed"].append(mid)
+                if mid not in j["failed"]:
+                    j["failed"].append(mid)
                 j["failed_reasons"][str(mid)] = f"{type(e).__name__}: {e}"
+                log.exception("File processing failed: job=%s message=%s", jid, mid)
+
             finally:
-                j["current"] = None; await save(); await safe_progress(jid, True)
+                j["current"] = None
+                await save()
+                await safe_progress(jid, True)
                 if not j.get("cancel_requested"):
                     await asyncio.sleep(get_delay(jid))
+
         if j.get("cancel_requested"):
             j["status"] = "cancelled"
         elif j["failed"]:
             j["status"] = "completed_with_failures"
         else:
             j["status"] = "completed"
+
     finally:
         j["current"] = None
         await save()
         await safe_progress(jid, True)
         try:
             await post_end(jid)
-        except Exception as e:
+        except Exception:
             log.exception("End post failed for job %s", jid)
+        if j.get("status") in {"completed", "completed_with_failures"}:
             try:
-                await app.send_message(j["owner"], f"End post failed for job {jid}: {type(e).__name__}: {e}")
+                await app.send_message(j["owner"], f"Job {jid} finished with status: {j['status']}.")
             except Exception:
                 pass
-        try: await app.send_message(j["owner"], summary(jid))
-        except Exception: pass
 
-@app.on_callback_query()
 async def callbacks(_, q: CallbackQuery):
     if not q.from_user or q.from_user.id not in ADMINS: return await q.answer("Not authorized", show_alert=True)
     parts = q.data.split(":"); action = parts[0]
