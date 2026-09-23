@@ -202,6 +202,7 @@ def main_kb():
     return InlineKeyboardMarkup([
         [ib("Set Artist", "m:artist", "artist", ButtonStyle.PRIMARY),
          ib("Set Cover", "m:cover", "cover", ButtonStyle.PRIMARY)],
+        [ib("Global Metadata", "m:meta", "genre", ButtonStyle.PRIMARY)],
         [ib("New Job", "m:new", "new", ButtonStyle.PRIMARY),
          ib("Jobs", "m:jobs", "jobs", ButtonStyle.PRIMARY)],
         [ib("Set Source", "m:source", "source", ButtonStyle.PRIMARY),
@@ -791,11 +792,17 @@ async def callbacks(_, q: CallbackQuery):
         if sub == "jobs":
             rows = [f"{x} - {j['status']} - {len(j['processed'])}/{j['total']}" for x,j in list(jobs.items())[-20:]]
             return await q.message.reply_text("JOBS\n\n" + ("\n".join(rows) or "No jobs."), reply_markup=main_kb())
-        if sub in {"artist", "source", "target", "delay"}:
+        if sub == "artist":
+            sessions[q.from_user.id] = None
+            sessions[(q.from_user.id, "global_field")] = "artist"
+            return await q.message.reply_text("Send global artist name.")
+        if sub in {"source", "target", "delay"}:
             sessions[q.from_user.id] = None
             sessions[(q.from_user.id, "global_field")] = sub
-            prompts = {"artist":"Send global artist name.", "source":"Send source channel username or ID.", "target":"Send target channel username or ID.", "delay":"Send delay in seconds (3-60)."}
+            prompts = {"source":"Send source channel username or ID.", "target":"Send target channel username or ID.", "delay":"Send delay in seconds (3-60)."}
             return await q.message.reply_text(prompts[sub])
+        if sub == "meta":
+            return await q.message.reply_text("Global metadata", reply_markup=global_meta_kb())
         if sub == "cover":
             sessions[(q.from_user.id, "global_cover")] = True
             return await q.message.reply_text("Send the cover image now.")
@@ -808,9 +815,58 @@ async def callbacks(_, q: CallbackQuery):
         if sub == "help":
             return await q.message.reply_text("Use /batch to create a Batch job. Set Source and Target from the menu. Set Artist and Cover are global defaults. Delay controls the seconds between files.")
 
+    if action == "gm":
+        sub = parts[1]
+        if sub == "back":
+            await q.answer()
+            return await q.message.edit_text("Welcome to Cleanfi", reply_markup=main_kb())
+        if sub in {"artist","album","album_artist","genre","year","comment"}:
+            sessions[q.from_user.id] = None
+            sessions[(q.from_user.id, "global_field")] = sub
+            if sub == "genre":
+                rows = [[ib(x, f"gg:{i}", "genre", ButtonStyle.PRIMARY)] for i,x in enumerate(GENRE_OPTIONS)]
+                rows.append([ib("Custom", "gg:custom", "genre", ButtonStyle.PRIMARY)])
+                await q.answer()
+                return await q.message.reply_text("Choose global genre:", reply_markup=InlineKeyboardMarkup(rows))
+            await q.answer()
+            return await q.message.reply_text(f"Send global {sub.replace('_',' ')}.")
+    if action == "gg":
+        value = parts[1]
+        if value == "custom":
+            sessions[q.from_user.id] = None
+            sessions[(q.from_user.id, "global_field")] = "genre"
+            await q.answer()
+            return await q.message.reply_text("Send custom global genre.")
+        settings.setdefault("global_meta", {})["genre"] = GENRE_OPTIONS[int(value)]
+        await save()
+        sessions.pop((q.from_user.id, "global_field"), None)
+        await q.answer(f"Global genre set: {GENRE_OPTIONS[int(value)]}")
+        return await q.message.reply_text("Global metadata saved.", reply_markup=global_meta_kb())
+    if action == "confirm":
+        kind = parts[1] if len(parts) > 1 else ""
+        await q.answer("Confirmed")
+        return await q.message.reply_text(f"{kind.title()} confirmed.", reply_markup=main_kb())
+    if action == "cancel_confirm":
+        await q.answer("Cancelled")
+        return await q.message.reply_text("Cancelled.", reply_markup=main_kb())
+
     jid = parts[-1]
     if jid not in jobs: return await q.answer("Unknown job", show_alert=True)
-    if action == "start": await q.answer(); return await launch(jid, q.message)
+    if action == "start":
+        await q.answer()
+        return await q.message.reply_text(
+            f"Confirm start of Job {jid}?\n\n{summary(jid)}",
+            reply_markup=InlineKeyboardMarkup([
+                [ib("Confirm", f"confirm_start:{jid}", "start", ButtonStyle.SUCCESS),
+                 ib("Cancel", f"cancel_confirm:{jid}", "cancel", ButtonStyle.DANGER)]
+            ])
+        )
+    if action == "confirm_start":
+        await q.answer("Starting")
+        return await launch(jid, q.message)
+    if action == "cancel_confirm":
+        await q.answer("Cancelled")
+        return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
     if action == "cancel":
         jobs[jid]["cancel_requested"] = True
         if jobs[jid].get("status") == "queued":
@@ -846,11 +902,11 @@ async def field_input(_, m):
     if text.startswith("/"): return
     global_field = sessions.get((m.from_user.id, "global_field"))
     if global_field:
-        if global_field == "artist":
-            settings.setdefault("global_meta", {})["artist"] = text
+        if global_field in {"artist","album","album_artist","year","comment"}:
+            settings.setdefault("global_meta", {})[global_field] = text
             await save()
             sessions.pop((m.from_user.id, "global_field"), None)
-            return await m.reply_text("Global artist saved.", reply_markup=main_kb())
+            return await m.reply_text(f"Global {global_field.replace('_',' ')} saved: {text}", reply_markup=global_meta_kb())
         if global_field in {"source", "target"}:
             try:
                 c = await resolve_chat(text)
