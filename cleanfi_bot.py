@@ -201,14 +201,18 @@ def ib(text, data, emoji=None, style=ButtonStyle.PRIMARY):
     return InlineKeyboardButton(text, **kw)
 
 def global_meta_kb():
+    g = settings.get("global_meta", {})
+    def v(k):
+        x = g.get(k)
+        return str(x) if x not in (None, "") else "Not set"
     return InlineKeyboardMarkup([
-        [ib("Artist", "gm:artist", "artist", ButtonStyle.PRIMARY),
-         ib("Album", "gm:album", "genre", ButtonStyle.PRIMARY)],
-        [ib("Album Artist", "gm:album_artist", "artist", ButtonStyle.PRIMARY),
-         ib("Genre", "gm:genre", "genre", ButtonStyle.PRIMARY)],
-        [ib("Year", "gm:year", "status", ButtonStyle.PRIMARY),
-         ib("Comment", "gm:comment", "help", ButtonStyle.PRIMARY)],
-        [ib("Cover", "gm:cover", "cover", ButtonStyle.PRIMARY)],
+        [ib(f"Artist: {v('artist')}", "gm:artist", "artist", ButtonStyle.PRIMARY),
+         ib(f"Album: {v('album')}", "gm:album", "genre", ButtonStyle.PRIMARY)],
+        [ib(f"Album Artist: {v('album_artist')}", "gm:album_artist", "artist", ButtonStyle.PRIMARY),
+         ib(f"Genre: {v('genre')}", "gm:genre", "genre", ButtonStyle.PRIMARY)],
+        [ib(f"Year: {v('year')}", "gm:year", "status", ButtonStyle.PRIMARY),
+         ib(f"Comment: {v('comment')}", "gm:comment", "help", ButtonStyle.PRIMARY)],
+        [ib(f"Cover: {'Set' if g.get('cover_path') else 'Not set'}", "gm:cover", "cover", ButtonStyle.PRIMARY)],
         [ib("Back", "gm:back", "cancel", ButtonStyle.DANGER)],
     ])
 
@@ -497,15 +501,27 @@ async def meta_cmd(_, m):
         if k in jobs[jid]["meta"]: jobs[jid]["meta"][k] = a or b or c
     await save(); await m.reply_text(summary(jid), reply_markup=job_kb(jid))
 
+async def _save_global_cover(m):
+    if not allowed(m) or not sessions.get((m.from_user.id, "global_cover")):
+        return False
+    path = TEMP / "global_cover.jpg"
+    try:
+        await tg_call(lambda: m.download(file_name=str(path)), None, "global cover download")
+    except Exception as e:
+        log.exception("GLOBAL COVER DOWNLOAD FAILED user=%s", m.from_user.id)
+        await m.reply_text(f"Global cover download failed: {type(e).__name__}: {e}")
+        return True
+    sessions.pop((m.from_user.id, "global_cover"), None)
+    sessions[(m.from_user.id, "pending_global")] = ("cover_path", str(path))
+    log.info("GLOBAL COVER RECEIVED user=%s path=%s", m.from_user.id, path)
+    await m.reply_text("Global cover received.\n\nConfirm?", reply_markup=confirm_kb("global"))
+    return True
+
 @app.on_message(filters.private & filters.photo)
 async def cover_photo(_, m):
+    if await _save_global_cover(m):
+        return
     if not allowed(m): return
-    if sessions.get((m.from_user.id, "global_cover")):
-        path = TEMP / "global_cover.jpg"
-        await tg_call(lambda: m.download(file_name=str(path)), None, "global cover download")
-        sessions.pop((m.from_user.id, "global_cover"), None)
-        sessions[(m.from_user.id, "pending_global")] = ("cover_path", str(path))
-        return await m.reply_text("Global cover received.\n\nConfirm?", reply_markup=confirm_kb("global"))
     if sessions.get((m.from_user.id, "startpost")):
         return
     p = (m.caption or "").split(); jid = p[1] if len(p) == 2 and p[0].lower() == "/cover" else active(m)
@@ -513,7 +529,24 @@ async def cover_photo(_, m):
     d = TEMP / jid; d.mkdir(exist_ok=True); path = d / "cover.jpg"
     await tg_call(lambda: m.download(file_name=str(path)), jid, "cover download")
     jobs[jid]["meta"]["cover_path"] = str(path); await save()
-    await m.reply_text(summary(jid), reply_markup=job_kb(jid))
+    await m.reply_text("Job cover saved successfully.", reply_markup=job_kb(jid))
+
+@app.on_message(filters.private & filters.document)
+async def cover_document(_, m):
+    if not allowed(m): return
+    doc = m.document
+    if not doc or not (doc.mime_type or "").startswith("image/"):
+        return
+    if await _save_global_cover(m):
+        return
+    if sessions.get((m.from_user.id, "startpost")):
+        return
+    jid = active(m)
+    if not jid or jid not in jobs: return
+    d = TEMP / jid; d.mkdir(exist_ok=True); path = d / "cover.jpg"
+    await tg_call(lambda: m.download(file_name=str(path)), jid, "cover document download")
+    jobs[jid]["meta"]["cover_path"] = str(path); await save()
+    await m.reply_text("Job cover saved successfully.", reply_markup=job_kb(jid))
 
 @app.on_message(filters.private & filters.command("cover"))
 async def cover_cmd(_, m):
@@ -905,7 +938,11 @@ async def callbacks(_, q: CallbackQuery):
             await save()
             log.info("GLOBAL SET user=%s field=%s value=%s", q.from_user.id, field, value)
             await q.answer("Saved")
-            return await q.message.edit_text(f"Global {field.replace('_',' ')} saved:\n\n{value}", reply_markup=global_meta_kb() if field in {"artist","album","album_artist","genre","year","comment"} else main_kb())
+            if field == "cover_path":
+                label = "Cover"
+                return await q.message.edit_text("Global Cover saved successfully.", reply_markup=global_meta_kb())
+            label = field.replace("_", " ").title()
+            return await q.message.edit_text(f"Global {label} saved successfully.\n\nValue: {value}", reply_markup=global_meta_kb() if field in {"artist","album","album_artist","genre","year","comment","cover_path"} else main_kb())
         if kind == "job":
             pending = sessions.pop((q.from_user.id, "pending_job"), None)
             if not pending:
@@ -1020,10 +1057,10 @@ async def field_input(_, m):
         if global_field in {"source", "target"}:
             try:
                 c = await resolve_chat(text)
-                sessions[(m.from_user.id, "pending_global")] = (global_field, str(c.id), c.title or c.first_name)
+                sessions[(m.from_user.id, "pending_global")] = (global_field, str(c.id))
                 sessions.pop((m.from_user.id, "global_field"), None)
                 return await m.reply_text(
-                    f"{global_field.title()}:\n{c.title or c.first_name}\nID: {c.id}\n\nConfirm?",
+                    f"{global_field.title()} found:\n{c.title or c.first_name}\nID: {c.id}\n\nConfirm?",
                     reply_markup=confirm_kb("global")
                 )
             except Exception as e:
