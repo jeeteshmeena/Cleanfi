@@ -1,4 +1,4 @@
-import os,re,json,asyncio,time,uuid,shutil,logging
+import os,re,json,asyncio,time,uuid,shutil
 from pathlib import Path
 from collections import deque
 from pyrogram import Client,filters
@@ -7,50 +7,45 @@ from pyrogram.errors import FloodWait
 from dotenv import load_dotenv
 from mutagen import File as MFile
 from metadata import clean_and_apply_metadata,read_original_title
-
 load_dotenv()
-log=logging.getLogger("cleanfi.core")
 API_ID=int(os.environ['API_ID']);API_HASH=os.environ['API_HASH'];BOT_TOKEN=os.environ['BOT_TOKEN']
-ADMINS={int(x) for x in os.getenv('ADMIN_IDS','').split(',') if x.strip()}
-TEMP=Path(os.getenv('TEMP_DIR','./tmp'));TEMP.mkdir(parents=True,exist_ok=True)
-STATE=Path(os.getenv('STATE_FILE','./jobs.json'))
+ADMINS={int(x) for x in os.getenv('ADMIN_IDS','').split(',') if x.strip()};TEMP=Path(os.getenv('TEMP_DIR','./tmp'));TEMP.mkdir(parents=True,exist_ok=True);STATE=Path(os.getenv('STATE_FILE','./jobs.json'))
 DEFAULT_DELAY=max(1,int(os.getenv('FILE_DELAY_SECONDS','3')));MAX_QUEUE=max(1,int(os.getenv('MAX_QUEUED_JOBS','20')));DEFAULT_RETRIES=max(0,int(os.getenv('TRANSIENT_RETRIES','5')))
-
-# A fresh in-memory MTProto session avoids stale local .session update state.
-# The bot token authenticates the bot on every startup; no user session file is used.
-app=Client('cleanfi-runtime',api_id=API_ID,api_hash=API_HASH,bot_token=BOT_TOKEN,in_memory=True)
-
-jobs={};settings={};sessions={};queue=deque();queue_task=None;running=None;tg_lock=asyncio.Lock();state_lock=asyncio.Lock()
+app=Client('cleanfi',api_id=API_ID,api_hash=API_HASH,bot_token=BOT_TOKEN)
+jobs={};settings={};sessions={};queue=deque();queue_task=None;running=None;tg_lock=asyncio.Lock();state_lock=asyncio.Lock();flood_until=0
 
 def save_sync():
  p=STATE.with_suffix('.tmp');p.write_text(json.dumps({'settings':settings,'jobs':jobs,'queue':list(queue)},ensure_ascii=False,indent=2),encoding='utf-8');p.replace(STATE)
 async def save():
  async with state_lock: await asyncio.to_thread(save_sync)
-
-def meta(): return {'title_mode':'original','artist':None,'genre':None,'year':None,'album':None,'album_artist':None,'comment':None,'cover_path':None}
-
 def load():
  global jobs,settings,queue
  try:d=json.loads(STATE.read_text(encoding='utf-8'));settings=d.get('settings',{});jobs=d.get('jobs',{});queue=deque(d.get('queue',[]))
  except Exception:settings={};jobs={};queue=deque()
  settings.setdefault('source',os.getenv('SOURCE_CHAT_ID',''));settings.setdefault('target',os.getenv('TARGET_CHAT_ID',''));settings.setdefault('delay',DEFAULT_DELAY);settings.setdefault('mode','balanced');settings.setdefault('retries',DEFAULT_RETRIES);settings.setdefault('min_free_gb',2)
  for j in jobs.values():
-  j.setdefault('processed',[]);j.setdefault('failed',[]);j.setdefault('skipped',[]);j.setdefault('failed_reasons',{});j.setdefault('meta',meta());j.setdefault('source',settings['source']);j.setdefault('target',settings['target']);j.setdefault('flood_events',0);j.setdefault('flood_seconds',0);j.setdefault('retries',0);j.setdefault('cancel',False);j.setdefault('progress_message_id',None);j.setdefault('current',None);j.setdefault('started_at',None);j.setdefault('last_progress',0)
+  j.setdefault('processed',[]);j.setdefault('failed',[]);j.setdefault('skipped',[]);j.setdefault('failed_reasons',{});j.setdefault('meta',meta());j.setdefault('source',settings['source']);j.setdefault('target',settings['target']);j.setdefault('flood_events',0);j.setdefault('flood_seconds',0);j.setdefault('retries',0);j.setdefault('cancel',False);j.setdefault('progress_message_id',None);j.setdefault('current',None);j.setdefault('started_at',None)
   if j.get('status') in ('running','queued','cancelling'):j['status']='paused'
  queue=deque(x for x in queue if x in jobs and jobs[x].get('status') not in ('completed','completed_with_failures','cancelled'))
  for x,j in jobs.items():
   if j.get('status')=='paused' and not j.get('cancel') and x not in queue:queue.append(x)
-
 def ok(m):return bool(m.from_user and m.from_user.id in ADMINS)
 def jidof(m):
  p=(m.text or '').split();return p[1] if len(p)>1 and p[1] in jobs else sessions.get(m.from_user.id)
+def meta():return {'title_mode':'original','artist':None,'genre':None,'year':None,'album':None,'album_artist':None,'comment':None,'cover_path':None}
 def delay():return max(1,int(settings.get('delay',DEFAULT_DELAY)))
-def mode_delay():return {'conservative':max(5,delay()),'balanced':delay(),'fast':max(1,delay()-1)}.get(settings.get('mode','balanced'),delay())
+def mode_delay():return {'conservative':max(5,delay()),'balanced':delay(),'fast':max(1,delay()-1)}[settings.get('mode','balanced')]
 def flood_secs(e):
  if isinstance(e,FloodWait):return max(1,int(e.value))
  m=re.search(r'(?:wait of|waiting)\s+(\d+)\s*seconds?',str(e),re.I);return int(m.group(1)) if m else 10
 def is_flood(e):return isinstance(e,FloodWait) or 'FLOOD_WAIT' in str(e).upper() or ('A WAIT OF' in str(e).upper() and 'REQUIRED' in str(e).upper())
-
+async def pause_flood(x,e,label):
+ global flood_until
+ s=flood_secs(e);flood_until=time.time()+s;jobs[x]['flood_until']=flood_until;jobs[x]['flood_label']=label;jobs[x]['flood_events']+=1;jobs[x]['flood_seconds']+=s;await save()
+ while time.time()<flood_until:
+  if jobs[x].get('cancel'):return False
+  await progress(x,True);await asyncio.sleep(min(5,flood_until-time.time()))
+ jobs[x]['flood_until']=0;await save();return True
 async def tg(fn,x=None,label='Telegram'):
  while True:
   if x and jobs.get(x,{}).get('cancel'):raise asyncio.CancelledError()
@@ -58,33 +53,19 @@ async def tg(fn,x=None,label='Telegram'):
    async with tg_lock:return await fn()
   except Exception as e:
    if not is_flood(e):raise
-   seconds=flood_secs(e)
-   log.warning("FloodWait %ss during %s",seconds,label)
-   if not x:
-    await asyncio.sleep(seconds+1)
-    continue
-   j=jobs[x];j['flood_until']=time.time()+seconds;j['flood_label']=label;j['flood_events']=j.get('flood_events',0)+1;j['flood_seconds']=j.get('flood_seconds',0)+seconds;await save()
-   while time.time()<j['flood_until']:
-    if j.get('cancel'):raise asyncio.CancelledError()
-    await asyncio.sleep(min(5,max(0,j['flood_until']-time.time())))
-   j['flood_until']=0;await save()
-
+   if not x:return await asyncio.sleep(flood_secs(e)+1)
+   if not await pause_flood(x,e,label):raise asyncio.CancelledError()
 def bar(x):
  j=jobs[x];done=len(j['processed'])+len(j['failed'])+len(j['skipped']);t=j['total'];pct=int(done*100/t) if t else 100;w=16;n=int(w*pct/100);el=max(0,time.time()-(j.get('started_at') or time.time()));sp=done/(el/60) if done and el else 0;eta=((t-done)/sp*60) if sp else 0;fu=max(0,int(j.get('flood_until',0)-time.time()));return f"Cleanfi Processing\nJob: {x}\nStatus: {j['status']}\nCurrent: {j.get('current') or '—'}\n\n{'█'*n+'░'*(w-n)} {pct}%\nFiles: {done} / {t}\nProcessed: {len(j['processed'])}\nFailed: {len(j['failed'])}\nSkipped: {len(j['skipped'])}\nSpeed: {sp:.1f} files/min\nElapsed: {int(el//60)}m {int(el%60)}s\nETA: {int(eta//60)}m {int(eta%60)}s\nFloodWait: {'Waiting '+str(fu)+'s' if fu else 'Protected'}\nDelay: {delay()}s/file\nFloodWait events: {j.get('flood_events',0)}\nRetries: {j.get('retries',0)}"
-
 async def progress(x,force=False):
  if x not in jobs:return
  j=jobs[x];now=time.time()
  if not force and now-j.get('last_progress',0)<3:return
  j['last_progress']=now
  try:
-  if j.get('progress_message_id'):
-   await tg(lambda:app.edit_message_text(j['owner'],j['progress_message_id'],bar(x)),x,'progress')
-  else:
-   sent=await tg(lambda:app.send_message(j['owner'],bar(x)),x,'progress')
-   j['progress_message_id']=sent.id
- except asyncio.CancelledError:raise
- except Exception as e:log.warning("Progress update failed: %s",e)
+  if j.get('progress_message_id'):await app.edit_message_text(j['owner'],j['progress_message_id'],bar(x))
+  else:j['progress_message_id']=(await app.send_message(j['owner'],bar(x))).id
+ except Exception:pass
 
 def menu():return InlineKeyboardMarkup([[InlineKeyboardButton('New Job',callback_data='m:new'),InlineKeyboardButton('Jobs',callback_data='m:jobs')],[InlineKeyboardButton('Queue',callback_data='m:queue'),InlineKeyboardButton('Settings',callback_data='m:settings')],[InlineKeyboardButton('Source',callback_data='m:source'),InlineKeyboardButton('Target',callback_data='m:target')],[InlineKeyboardButton('Status',callback_data='m:status'),InlineKeyboardButton('Help',callback_data='m:help')]])
 def sk():return InlineKeyboardMarkup([[InlineKeyboardButton(f"Delay: {delay()}s",callback_data='set:delay'),InlineKeyboardButton(f"Mode: {settings.get('mode','balanced').title()}",callback_data='set:mode')],[InlineKeyboardButton(f"Retries: {settings.get('retries',DEFAULT_RETRIES)}",callback_data='set:retries')],[InlineKeyboardButton('Back',callback_data='m:back')]])
@@ -101,8 +82,9 @@ async def launch(x,ids=None):
  jobs[x]['queue_ids']=list(ids) if ids is not None else jobs[x].get('queue_ids');jobs[x]['status']='queued';jobs[x]['cancel']=False
  if x not in queue:queue.append(x)
  await save()
- if queue_task is None or queue_task.done():queue_task=asyncio.create_task(worker(),name='cleanfi-queue-worker')
-def qtext():return 'CLEANFI QUEUE\n\n'+('\n'.join(f"{i}. {x} — {jobs[x]['status']} — {len(jobs[x]['processed'])}/{jobs[x]['total']}" for i,x in enumerate(queue,1) if x in jobs) or 'Queue is empty.')
+ if queue_task is None or queue_task.done():queue_task=asyncio.create_task(worker())
+def qtext():
+ return 'CLEANFI QUEUE\n\n'+('\n'.join(f"{i}. {x} — {jobs[x]['status']} — {len(jobs[x]['processed'])}/{jobs[x]['total']}" for i,x in enumerate(queue,1) if x in jobs) or 'Queue is empty.')
 async def worker():
  global running
  while queue:
@@ -111,30 +93,17 @@ async def worker():
   if jobs[x].get('cancel'):jobs[x]['status']='cancelled';continue
   running=x;jobs[x]['status']='running';await save()
   try:await run(x,jobs[x].get('queue_ids'))
-  except asyncio.CancelledError:raise
-  except Exception as e:
-   log.exception('Queue job %s crashed',x);jobs[x]['status']='failed_queue';jobs[x]['failed_reasons']['__job__']=f'{type(e).__name__}: {e}';await save()
-   try:await tg(lambda:app.send_message(jobs[x]['owner'],f'Cleanfi job {x} stopped بسبب an internal error. Use /status {x} and /retry {x}.') ,None,'job error')
-   except Exception:pass
+  except Exception as e:jobs[x]['status']='failed_queue';jobs[x]['failed_reasons']['__job__']=f'{type(e).__name__}: {e}'
   running=None;await save()
-
-def infer_name(media):
- name=media.file_name or ''
- if name:return name
- mime=(getattr(media,'mime_type',None) or '').lower()
- return {'audio/mpeg':f'message_{media.file_id}.mp3','audio/mp4':f'message_{media.file_id}.m4a','audio/flac':f'message_{media.file_id}.flac','audio/ogg':f'message_{media.file_id}.ogg','audio/wav':f'message_{media.file_id}.wav','audio/x-wav':f'message_{media.file_id}.wav','audio/aac':f'message_{media.file_id}.aac','audio/x-ms-wma':f'message_{media.file_id}.wma'}.get(mime,f'message_{media.file_id}.bin')
-
 async def process(x,mid):
  j=jobs[x];attempt=0
  while True:
   try:
    if shutil.disk_usage(TEMP).free<settings.get('min_free_gb',2)*1024**3:return 'failed','Low disk space'
-   msg=await tg(lambda:app.get_messages(int(j['source']),mid),x,'get_messages')
-   media=msg.audio or (msg.document if msg.document and (msg.document.mime_type or '').lower().startswith('audio/') else None)
+   msg=await tg(lambda:app.get_messages(int(j['source']),mid),x,'get_messages');media=msg.audio or (msg.document if msg.document and (msg.document.mime_type or '').startswith('audio/') else None)
    if not media:return 'skip','no audio media'
-   name=infer_name(media);ext=Path(name).suffix.lower()
+   name=media.file_name or f'message_{mid}.bin';ext=Path(name).suffix.lower()
    if ext not in {'.mp3','.m4a','.mp4','.flac','.ogg','.opus','.wav','.aiff','.aif','.wma','.aac'}:return 'skip','unsupported '+ext
-   if ext=='.aac':return 'skip','raw AAC has no portable metadata container'
    d=TEMP/x;d.mkdir(exist_ok=True);inp=d/f'{mid}_{Path(name).name}';out=d/f'out_{mid}_{Path(name).name}'
    try:
     await tg(lambda:msg.download(file_name=str(inp)),x,'download');title=read_original_title(str(inp))
@@ -153,11 +122,12 @@ async def process(x,mid):
      except FileNotFoundError:pass
   except asyncio.CancelledError:raise
   except Exception as e:
-   if is_flood(e):continue
+   if is_flood(e):
+    if not await pause_flood(x,e,'file processing'):raise asyncio.CancelledError()
+    continue
    attempt+=1;j['retries']+=1;await save()
    if attempt>settings.get('retries',DEFAULT_RETRIES):return 'failed',f'{type(e).__name__}: {e}'
    await asyncio.sleep(min(30,2**attempt))
-
 async def run(x,ids=None):
  j=jobs[x];j['started_at']=j.get('started_at') or time.time();ids=ids if ids is not None else list(range(j['start'],j['end']+1));done=set(j['processed'])|set(j['skipped']);ids=[i for i in ids if i not in done];await progress(x,True)
  for mid in ids:
@@ -170,16 +140,13 @@ async def run(x,ids=None):
   elif r=='failed' and mid not in j['failed']:j['failed'].append(mid);j['failed_reasons'][str(mid)]=reason
   j['current']=None;await save();await progress(x,True)
   if not j.get('cancel'):await asyncio.sleep(mode_delay())
- j['status']='cancelled' if j.get('cancel') else ('completed_with_failures' if j['failed'] else ('completed_with_skips' if j['skipped'] else 'completed'));j['completed_at']=time.time();await save();await progress(x,True)
- try:await tg(lambda:app.send_message(j['owner'],summary(x)),None,'summary')
- except Exception as e:log.warning('Summary send failed: %s',e)
+ j['status']='cancelled' if j.get('cancel') else ('completed_with_failures' if j['failed'] else 'completed');j['completed_at']=time.time();await save();await progress(x,True)
+ try:await app.send_message(j['owner'],summary(x))
+ except Exception:pass
 
 @app.on_message(filters.private&filters.command(['start','menu']))
 async def menu_cmd(_,m):
- if ok(m):
-  log.info('Handling %s from admin=%s',m.text,m.from_user.id)
-  await tg(lambda:m.reply_text('CLEANFI\n\nAudiobook metadata cleaner and repacker.',reply_markup=menu()),None,'command reply')
-
+ if ok(m):await m.reply_text('CLEANFI\n\nAudiobook metadata cleaner and repacker.',reply_markup=menu())
 @app.on_message(filters.private&filters.command('range'))
 async def range_cmd(_,m):
  if not ok(m):return
@@ -190,12 +157,12 @@ async def range_cmd(_,m):
 @app.on_message(filters.private&filters.command('source'))
 async def source(_,m):
  if ok(m) and len((m.text or '').split())==2:
-  try:c=await tg(lambda:app.get_chat((m.text.split())[1]),None,'get_chat');settings['source']=str(c.id);await save();await m.reply_text(f'Source set: {c.title or c.first_name}\nID: {c.id}',reply_markup=menu())
+  try:c=await tg(lambda:app.get_chat((m.text.split())[1]));settings['source']=str(c.id);await save();await m.reply_text(f'Source set: {c.title or c.first_name}\nID: {c.id}',reply_markup=menu())
   except Exception as e:await m.reply_text(f'Could not set source: {e}')
 @app.on_message(filters.private&filters.command('target'))
 async def target(_,m):
  if ok(m) and len((m.text or '').split())==2:
-  try:c=await tg(lambda:app.get_chat((m.text.split())[1]),None,'get_chat');settings['target']=str(c.id);await save();await m.reply_text(f'Target set: {c.title or c.first_name}\nID: {c.id}',reply_markup=menu())
+  try:c=await tg(lambda:app.get_chat((m.text.split())[1]));settings['target']=str(c.id);await save();await m.reply_text(f'Target set: {c.title or c.first_name}\nID: {c.id}',reply_markup=menu())
   except Exception as e:await m.reply_text(f'Could not set target: {e}')
 @app.on_message(filters.private&filters.command('startjob'))
 async def startjob(_,m):
@@ -289,3 +256,9 @@ async def input_text(_,m):
 @app.on_message(filters.private&filters.command('help'))
 async def help_cmd(_,m):
  if ok(m):await m.reply_text('CLEANFI\n\n/menu\n/range START END\n/source @channel\n/target @channel\n/meta artist="Name" genre="Romance" year=2026\n/cover JOBID\n/startjob JOBID\n/queue\n/status JOBID\n/cancel JOBID\n/retry JOBID\n/failed JOBID\n/jobs\n/settings\n\nFloodWait is never counted as a file failure. The same file waits and retries automatically.')
+async def main_async():
+ load();await app.start()
+ if queue:globals()['queue_task']=asyncio.create_task(worker())
+ await asyncio.Event().wait()
+def main():asyncio.run(main_async())
+if __name__=='__main__':main()

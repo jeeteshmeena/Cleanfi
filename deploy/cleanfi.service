@@ -5,10 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=ubuntu
-WorkingDirectory=/home/ubuntu/Cleanfi
-EnvironmentFile=/home/ubuntu/Cleanfi/.env
-ExecStart=/home/ubuntu/Cleanfi/.venv/bin/python /home/ubuntu/Cleanfi/bot.py
+User=cleanfi
+WorkingDirectory=/opt/cleanfi
+EnvironmentFile=/opt/cleanfi/.env
+ExecStart=/opt/cleanfi/.venv/bin/python /opt/cleanfi/bot.py
 Restart=always
 RestartSec=5
 NoNewPrivileges=true
