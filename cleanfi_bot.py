@@ -142,9 +142,16 @@ async def resolve_chat(value):
     value = str(value).strip()
     return await tg_call(lambda: app.get_chat(int(value) if re.fullmatch(r"-?\d+", value) else value), label="get_chat")
 
+ACTIVITY_EMOJI = {
+    "Downloading": ("5433811242135331842", "📥"),
+    "Cleaning metadata": ("5472386005573049567", "🧼"),
+    "Uploading": ("5433614747381538714", "📤"),
+}
+
 async def activity(jid, stage, detail=""):
     j = jobs[jid]
-    text = f'<tg-emoji emoji-id="{EMOJI["new"]}">✦</tg-emoji> <b>{stage}</b>\nJob: <code>{jid}</code>'
+    emoji_id, alt = ACTIVITY_EMOJI.get(stage, (EMOJI["status"], "📊"))
+    text = f'<tg-emoji emoji-id="{emoji_id}">{alt}</tg-emoji> <b>{stage}…</b>\nJob: <code>{jid}</code>'
     if detail:
         text += "\n" + detail
     try:
