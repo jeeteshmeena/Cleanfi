@@ -92,6 +92,8 @@ def infer_name(media):
     ext = {"audio/mpeg": ".mp3", "audio/mp4": ".m4a", "audio/flac": ".flac", "audio/ogg": ".ogg", "audio/opus": ".opus", "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/aac": ".aac", "audio/x-ms-wma": ".wma"}.get(mime, ".bin")
     return f"message_{getattr(media, 'file_id', 'unknown')}{ext}"
 
+END_POST_TEXT = "Hey, the story is complete. Hope you like it 🫶🏻.\n\nIf you're looking for another story, then try… @StoriesByJeetXNew"
+
 def newmeta():
     return {"title_mode": "original", "artist": None, "genre": None, "year": None,
             "album": None, "album_artist": None, "comment": None, "cover_path": None}
@@ -202,7 +204,10 @@ async def create_job(owner, start, end):
                  "processed": [], "failed": [], "failed_reasons": {}, "skipped": [], "status": "configured",
                  "cancel_requested": False, "meta": newmeta(), "source": settings["source"], "target": settings["target"],
                  "created": time.time(), "started_at": None, "progress_message_id": None,
-                 "current": None, "flood_until": 0, "queue_ids": None, "delay_seconds": int(settings.get("file_delay", DEFAULT_DELAY_SECONDS))}
+                 "current": None, "flood_until": 0, "queue_ids": None,
+                 "delay_seconds": int(settings.get("file_delay", DEFAULT_DELAY_SECONDS)),
+                 "start_post": {"image_path": None, "caption": None, "sent": False},
+                 "end_post_sent": False}
     sessions[owner] = jid
     await save()
     return jid
@@ -211,6 +216,30 @@ async def raw_update(_, update, users, chats):
     log.info("RAW TELEGRAM UPDATE: %s", type(update).__name__)
 
 app.add_handler(RawUpdateHandler(raw_update), group=-1000)
+
+async def post_start(jid):
+    j = jobs[jid]
+    post = j.get("start_post") or {}
+    path = post.get("image_path")
+    caption = (post.get("caption") or "").strip()
+    if not path or not caption or post.get("sent"):
+        return False
+    if not Path(path).is_file():
+        log.warning("Start post image missing for job %s: %s", jid, path)
+        return False
+    await tg_call(lambda: app.send_photo(int(j["target"]), photo=path, caption=caption), jid, "start post")
+    post["sent"] = True
+    await save()
+    return True
+
+async def post_end(jid):
+    j = jobs[jid]
+    if j.get("end_post_sent"):
+        return
+    await tg_call(lambda: app.send_message(int(j["target"]), END_POST_TEXT), jid, "end post")
+    j["end_post_sent"] = True
+    await save()
+
 
 @app.on_message(filters.private & filters.text, group=-100)
 async def entry_fallback(_, m):
@@ -274,6 +303,43 @@ async def delay_cmd(_, m):
         jobs[jid]["delay_seconds"] = seconds
         await save()
     await m.reply_text(f"Episode delay set to {seconds} seconds. New jobs will use this delay.")
+
+@app.on_message(filters.private & filters.command("startpost"))
+async def startpost_cmd(_, m):
+    if not allowed(m): return
+    p = (m.text or "").split(maxsplit=1)
+    jid = p[1].strip() if len(p) == 2 else active(m)
+    if not jid or jid not in jobs:
+        return await m.reply_text("Create/select a job first. Usage: /startpost JOB_ID")
+    if jobs[jid].get("status") in {"running", "queued"}:
+        return await m.reply_text("Set the start post before starting the job.")
+    sessions[m.from_user.id] = jid
+    sessions[(m.from_user.id, "startpost")] = True
+    await m.reply_text(f"Send the start image now with the story name as its caption.\nJob: {jid}")
+
+@app.on_message(filters.private & filters.photo)
+async def startpost_photo(_, m):
+    if not allowed(m): return
+    if not sessions.get((m.from_user.id, "startpost")):
+        return
+    jid = sessions.get(m.from_user.id)
+    if not jid or jid not in jobs:
+        sessions.pop((m.from_user.id, "startpost"), None)
+        return await m.reply_text("Unknown job. Create/select the job again.")
+    caption = (m.caption or "").strip()
+    if not caption:
+        return await m.reply_text("Please send the image with the story name as the caption.")
+    if len(caption) > 1024:
+        return await m.reply_text("Story name/caption is too long. Telegram allows up to 1024 characters here.")
+    d = TEMP / jid
+    d.mkdir(exist_ok=True)
+    path = d / "start_post.jpg"
+    await tg_call(lambda: m.download(file_name=str(path)), jid, "start post image download")
+    jobs[jid]["start_post"] = {"image_path": str(path), "caption": caption, "sent": False}
+    sessions.pop((m.from_user.id, "startpost"), None)
+    await save()
+    await m.reply_text(f"Start post saved for job {jid}.\nCaption: {caption}")
+    m.stop_propagation()
 
 @app.on_message(filters.private & filters.command("range"))
 async def range_cmd(_, m):
@@ -483,6 +549,15 @@ async def run_job(jid, ids=None):
     ids = [i for i in ids if i not in completed]
     await safe_progress(jid, True)
     try:
+        if j.get("start_post", {}).get("image_path") and not j.get("start_post", {}).get("sent"):
+            try:
+                await post_start(jid)
+            except Exception as e:
+                log.exception("Start post failed for job %s", jid)
+                try:
+                    await app.send_message(j["owner"], f"Start post failed for job {jid}: {type(e).__name__}: {e}\nThe file task will continue.")
+                except Exception:
+                    pass
         for mid in ids:
             if j.get("cancel_requested"): break
             j["current"] = mid; await safe_progress(jid, True)
@@ -511,7 +586,17 @@ async def run_job(jid, ids=None):
         else:
             j["status"] = "completed"
     finally:
-        j["current"] = None; await save(); await safe_progress(jid, True)
+        j["current"] = None
+        await save()
+        await safe_progress(jid, True)
+        try:
+            await post_end(jid)
+        except Exception as e:
+            log.exception("End post failed for job %s", jid)
+            try:
+                await app.send_message(j["owner"], f"End post failed for job {jid}: {type(e).__name__}: {e}")
+            except Exception:
+                pass
         try: await app.send_message(j["owner"], summary(jid))
         except Exception: pass
 
