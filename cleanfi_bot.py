@@ -238,7 +238,8 @@ def job_kb(jid):
         [ib(f"Cover: {'Attached' if m.get('cover_path') else 'Not set'}", f"cover:{jid}", "cover", ButtonStyle.PRIMARY),
          ib("Clear", f"clear:{jid}", "cancel", ButtonStyle.DANGER)],
         [ib("START", f"start:{jid}", "start", ButtonStyle.SUCCESS),
-         ib("Cancel", f"cancel:{jid}", "cancel", ButtonStyle.DANGER)],
+         ib("CANCEL JOB", f"cancel:{jid}", "cancel", ButtonStyle.DANGER)],
+        [ib("Refresh", f"refresh:{jid}", "status", ButtonStyle.PRIMARY)],
     ])
 
 def summary(jid):
@@ -518,15 +519,21 @@ async def failed_cmd(_, m):
 async def cancel_cmd(_, m):
     if not allowed(m): return
     jid = getjid(m)
-    if jid in jobs:
-        jobs[jid]["cancel_requested"] = True
-        if jobs[jid].get("status") == "queued":
-            queued_jobs.discard(jid)
-            jobs[jid]["status"] = "cancelled"
-        else:
-            jobs[jid]["status"] = "cancelling"
-        await save()
-        await m.reply_text(f"Cancellation requested: {jid}")
+    if jid not in jobs:
+        return await m.reply_text("Unknown Job ID. Use /cancel JOB_ID or open Jobs.")
+    j = jobs[jid]
+    if j.get("status") in {"completed", "completed_with_failures", "cancelled", "failed_queue"}:
+        return await m.reply_text(f"Job {jid} is already stopped.", reply_markup=job_kb(jid))
+    j["cancel_requested"] = True
+    if j.get("status") == "queued":
+        queued_jobs.discard(jid)
+        j["status"] = "cancelled"
+        j["current"] = None
+    else:
+        j["status"] = "cancelling"
+    await save()
+    log.info("CANCEL command user=%s job=%s status=%s", m.from_user.id, jid, j["status"])
+    await m.reply_text(f"Cancellation requested for Job {jid}. The current operation will finish safely, then the job will stop.", reply_markup=job_kb(jid))
 
 @app.on_message(filters.private & filters.command("retry"))
 async def retry_cmd(_, m):
@@ -874,27 +881,40 @@ async def callbacks(_, q: CallbackQuery):
 
     jid = parts[-1]
     if jid not in jobs: return await q.answer("Unknown job", show_alert=True)
+    if action == "refresh":
+        await q.answer("Updated")
+        return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
     if action == "start":
         await q.answer()
         return await q.message.reply_text(
             f"Confirm start of Job {jid}?\n\n{summary(jid)}",
             reply_markup=InlineKeyboardMarkup([
                 [ib("Confirm", f"confirm_start:{jid}", "start", ButtonStyle.SUCCESS),
-                 ib("Cancel", f"cancel_confirm:{jid}", "cancel", ButtonStyle.DANGER)]
+                 ib("Cancel", f"cancel_start:{jid}", "cancel", ButtonStyle.DANGER)]
             ])
         )
     if action == "confirm_start":
         await q.answer("Starting")
         return await launch(jid, q.message)
-    if action == "cancel_confirm":
+    if action == "cancel_start":
         await q.answer("Cancelled")
         return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
     if action == "cancel":
-        jobs[jid]["cancel_requested"] = True
-        if jobs[jid].get("status") == "queued":
-            queued_jobs.discard(jid); jobs[jid]["status"] = "cancelled"
-        else: jobs[jid]["status"] = "cancelling"
-        await save(); return await q.answer("Cancellation requested")
+        j = jobs[jid]
+        if j.get("status") in {"completed", "completed_with_failures", "cancelled", "failed_queue"}:
+            await q.answer("Job is already stopped.", show_alert=True)
+            return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
+        j["cancel_requested"] = True
+        if j.get("status") == "queued":
+            queued_jobs.discard(jid)
+            j["status"] = "cancelled"
+            j["current"] = None
+        else:
+            j["status"] = "cancelling"
+        await save()
+        log.info("CANCEL requested user=%s job=%s status=%s", q.from_user.id, jid, j["status"])
+        await q.answer("Cancellation requested")
+        return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
     if action == "clear": jobs[jid]["meta"]["cover_path"] = None; await save(); return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
     if action == "cover": return await q.answer(f"Send image with caption /cover {jid}", show_alert=True)
     if action == "genre":
