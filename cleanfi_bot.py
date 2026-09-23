@@ -524,12 +524,21 @@ async def cover_photo(_, m):
     if not allowed(m): return
     if sessions.get((m.from_user.id, "startpost")):
         return
-    p = (m.caption or "").split(); jid = p[1] if len(p) == 2 and p[0].lower() == "/cover" else active(m)
-    if not jid or jid not in jobs: return
+    jid = sessions.get(m.from_user.id) if sessions.get((m.from_user.id, "job_cover")) else active(m)
+    if not jid or jid not in jobs:
+        return
     d = TEMP / jid; d.mkdir(exist_ok=True); path = d / "cover.jpg"
-    await tg_call(lambda: m.download(file_name=str(path)), jid, "cover download")
-    jobs[jid]["meta"]["cover_path"] = str(path); await save()
-    await m.reply_text("Job cover saved successfully.", reply_markup=job_kb(jid))
+    try:
+        await tg_call(lambda: m.download(file_name=str(path)), jid, "job cover download")
+        jobs[jid]["meta"]["cover_path"] = str(path)
+        sessions.pop((m.from_user.id, "job_cover"), None)
+        sessions[m.from_user.id] = jid
+        await save()
+        log.info("JOB COVER SAVED user=%s job=%s path=%s", m.from_user.id, jid, path)
+        await m.reply_text(f"Job {jid} cover saved successfully.", reply_markup=job_kb(jid))
+    except Exception as e:
+        log.exception("JOB COVER FAILED user=%s job=%s", m.from_user.id, jid)
+        await m.reply_text(f"Job cover save failed: {type(e).__name__}: {e}", reply_markup=job_kb(jid))
 
 @app.on_message(filters.private & filters.document)
 async def cover_document(_, m):
@@ -541,12 +550,20 @@ async def cover_document(_, m):
         return
     if sessions.get((m.from_user.id, "startpost")):
         return
-    jid = active(m)
+    jid = sessions.get(m.from_user.id) if sessions.get((m.from_user.id, "job_cover")) else active(m)
     if not jid or jid not in jobs: return
     d = TEMP / jid; d.mkdir(exist_ok=True); path = d / "cover.jpg"
-    await tg_call(lambda: m.download(file_name=str(path)), jid, "cover document download")
-    jobs[jid]["meta"]["cover_path"] = str(path); await save()
-    await m.reply_text("Job cover saved successfully.", reply_markup=job_kb(jid))
+    try:
+        await tg_call(lambda: m.download(file_name=str(path)), jid, "job cover document download")
+        jobs[jid]["meta"]["cover_path"] = str(path)
+        sessions.pop((m.from_user.id, "job_cover"), None)
+        sessions[m.from_user.id] = jid
+        await save()
+        log.info("JOB COVER DOCUMENT SAVED user=%s job=%s path=%s", m.from_user.id, jid, path)
+        await m.reply_text(f"Job {jid} cover saved successfully.", reply_markup=job_kb(jid))
+    except Exception as e:
+        log.exception("JOB COVER DOCUMENT FAILED user=%s job=%s", m.from_user.id, jid)
+        await m.reply_text(f"Job cover save failed: {type(e).__name__}: {e}", reply_markup=job_kb(jid))
 
 @app.on_message(filters.private & filters.command("cover"))
 async def cover_cmd(_, m):
@@ -1013,7 +1030,11 @@ async def callbacks(_, q: CallbackQuery):
             "When the job starts, Cleanfi will send this image to the target channel and pin it automatically."
         )
     if action == "clear": jobs[jid]["meta"]["cover_path"] = None; await save(); return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
-    if action == "cover": return await q.answer(f"Send image with caption /cover {jid}", show_alert=True)
+    if action == "cover":
+        sessions[q.from_user.id] = jid
+        sessions[(q.from_user.id, "job_cover")] = True
+        await q.answer()
+        return await q.message.reply_text(f"Send the cover image for Job {jid} now. No command or caption is required.")
     if action == "genre":
         await q.answer()
         rows = [[InlineKeyboardButton(x, callback_data=f"g:{jid}:{i}")] for i,x in enumerate(GENRE_OPTIONS)]
