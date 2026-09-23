@@ -837,18 +837,36 @@ async def callbacks(_, q: CallbackQuery):
             sessions[(q.from_user.id, "global_field")] = "genre"
             await q.answer()
             return await q.message.reply_text("Send custom global genre.")
-        settings.setdefault("global_meta", {})["genre"] = GENRE_OPTIONS[int(value)]
-        await save()
+        sessions[(q.from_user.id, "pending_global")] = ("genre", GENRE_OPTIONS[int(value)])
         sessions.pop((q.from_user.id, "global_field"), None)
-        await q.answer(f"Global genre set: {GENRE_OPTIONS[int(value)]}")
-        return await q.message.reply_text("Global metadata saved.", reply_markup=global_meta_kb())
+        await q.answer()
+        return await q.message.reply_text(
+            f"Set global genre to: {GENRE_OPTIONS[int(value)]}\n\nConfirm?",
+            reply_markup=confirm_kb("global")
+        )
     if action == "confirm":
         kind = parts[1] if len(parts) > 1 else ""
+        if kind == "global":
+            pending = sessions.pop((q.from_user.id, "pending_global"), None)
+            if not pending:
+                await q.answer("Nothing pending", show_alert=True)
+                return
+            field = pending[0]
+            if field in {"source", "target"}:
+                settings[field] = pending[1]
+            elif field == "delay":
+                settings["file_delay"] = int(pending[1])
+            else:
+                settings.setdefault("global_meta", {})[field] = pending[1]
+            await save()
+            await q.answer("Saved")
+            return await q.message.reply_text("Global setting saved successfully.", reply_markup=main_kb())
         await q.answer("Confirmed")
         return await q.message.reply_text(f"{kind.title()} confirmed.", reply_markup=main_kb())
     if action == "cancel_confirm":
+        sessions.pop((q.from_user.id, "pending_global"), None)
         await q.answer("Cancelled")
-        return await q.message.reply_text("Cancelled.", reply_markup=main_kb())
+        return await q.message.reply_text("Cancelled. No changes were saved.", reply_markup=main_kb())
 
     jid = parts[-1]
     if jid not in jobs: return await q.answer("Unknown job", show_alert=True)
@@ -903,26 +921,29 @@ async def field_input(_, m):
     global_field = sessions.get((m.from_user.id, "global_field"))
     if global_field:
         if global_field in {"artist","album","album_artist","year","comment"}:
-            settings.setdefault("global_meta", {})[global_field] = text
-            await save()
+            sessions[(m.from_user.id, "pending_global")] = (global_field, text)
             sessions.pop((m.from_user.id, "global_field"), None)
-            return await m.reply_text(f"Global {global_field.replace('_',' ')} saved: {text}", reply_markup=global_meta_kb())
+            return await m.reply_text(
+                f"Set global {global_field.replace('_',' ')} to:\n{text}\n\nConfirm?",
+                reply_markup=confirm_kb("global")
+            )
         if global_field in {"source", "target"}:
             try:
                 c = await resolve_chat(text)
-                settings[global_field] = str(c.id)
-                await save()
+                sessions[(m.from_user.id, "pending_global")] = (global_field, str(c.id), c.title or c.first_name)
                 sessions.pop((m.from_user.id, "global_field"), None)
-                return await m.reply_text(f"{global_field.title()} saved.\n{c.title or c.first_name}\nID: {c.id}", reply_markup=main_kb())
+                return await m.reply_text(
+                    f"{global_field.title()}:\n{c.title or c.first_name}\nID: {c.id}\n\nConfirm?",
+                    reply_markup=confirm_kb("global")
+                )
             except Exception as e:
                 return await m.reply_text(f"Could not set {global_field}: {type(e).__name__}: {e}")
         if global_field == "delay":
             if not text.isdigit() or not (MIN_DELAY_SECONDS <= int(text) <= MAX_DELAY_SECONDS):
                 return await m.reply_text(f"Delay must be between {MIN_DELAY_SECONDS} and {MAX_DELAY_SECONDS} seconds.")
-            settings["file_delay"] = int(text)
-            await save()
+            sessions[(m.from_user.id, "pending_global")] = ("delay", int(text))
             sessions.pop((m.from_user.id, "global_field"), None)
-            return await m.reply_text(f"Delay set to {text} seconds.", reply_markup=main_kb())
+            return await m.reply_text(f"Set episode delay to {text} seconds.\n\nConfirm?", reply_markup=confirm_kb("global"))
         if global_field in {"status", "failed"}:
             jid = text
             sessions.pop((m.from_user.id, "global_field"), None)
