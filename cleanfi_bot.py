@@ -618,9 +618,7 @@ async def process_file(jid, mid):
     d = TEMP / jid; d.mkdir(exist_ok=True)
     inp = d / f"{mid}_{Path(name).name}"; out = d / f"out_{mid}_{Path(name).name}"
     try:
-        await activity(jid, "Downloading", f"File <code>#{mid}</code>")
         await download_media_direct(media, str(inp), jid)
-        await activity(jid, "Cleaning metadata", f"File <code>#{mid}</code>")
         title = read_original_title(str(inp))
         if title is None:
             try:
@@ -631,7 +629,6 @@ async def process_file(jid, mid):
             artist=j["meta"].get("artist"), genre=j["meta"].get("genre"), year=j["meta"].get("year"),
             cover=j["meta"].get("cover_path"), album=j["meta"].get("album"),
             album_artist=j["meta"].get("album_artist"), comment=j["meta"].get("comment"))
-        await activity(jid, "Uploading", f"File <code>#{mid}</code>")
         upload_bytes = out.stat().st_size if out.exists() else 0
         kw = {"audio": str(out), "caption": msg.caption or "", "file_name": name, "title": str(title)}
         if j["meta"].get("artist"): kw["performer"] = str(j["meta"]["artist"])
@@ -642,7 +639,6 @@ async def process_file(jid, mid):
         j["stats"]["bytes_uploaded"] = j.get("stats", {}).get("bytes_uploaded", 0) + upload_bytes
         return "ok", None
     finally:
-        await clear_activity(jid)
         for p in (inp, out):
             try: p.unlink()
             except FileNotFoundError: pass
@@ -820,7 +816,6 @@ async def run_job(jid, ids=None):
     finally:
         j["current"] = None
         j.setdefault("stats", {})["finished_at"] = time.time()
-        await clear_activity(jid)
         await save()
         await safe_progress(jid, True)
         if j.get("status") in {"completed", "completed_with_failures"}:
