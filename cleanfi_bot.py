@@ -2,6 +2,7 @@ import os, re, json, asyncio, time, uuid, logging
 from pathlib import Path
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from pyrogram.enums import ButtonStyle
 from pyrogram.errors import FloodWait
 from pyrogram.handlers import RawUpdateHandler
 from pyrogram.file_id import FileId
@@ -101,7 +102,7 @@ GENRE_OPTIONS = ["Drama", "Fantasy", "Suspense & Thriller", "Horror", "Romance",
 def newmeta():
     g = settings.get("global_meta", {})
     return {"title_mode": "original", "artist": g.get("artist"), "genre": g.get("genre"), "year": g.get("year"),
-            "album": g.get("album"), "album_artist": g.get("album_artist"), "comment": g.get("comment"), "cover_path": None}
+            "album": g.get("album"), "album_artist": g.get("album_artist"), "comment": g.get("comment"), "cover_path": g.get("cover_path")}
 
 async def tg_call(fn, jid=None, label="Telegram"):
     """Single-flight Telegram call with infinite FloodWait retry.
@@ -191,34 +192,57 @@ EMOJI = {
 def custom_emoji(emoji_id, alt):
     return f'<tg-emoji emoji-id="{emoji_id}">{alt}</tg-emoji>'
 
+def ib(text, data, emoji=None, style=ButtonStyle.PRIMARY):
+    kw = {"callback_data": data, "style": style}
+    if emoji:
+        kw["icon_custom_emoji_id"] = EMOJI[emoji]
+    return InlineKeyboardButton(text, **kw)
+
 def main_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Set Artist", callback_data="m:artist", icon_custom_emoji_id=EMOJI["artist"]),
-         InlineKeyboardButton("Set Cover", callback_data="m:cover", icon_custom_emoji_id=EMOJI["cover"])],
-        [InlineKeyboardButton("New Job", callback_data="m:new", icon_custom_emoji_id=EMOJI["new"]),
-         InlineKeyboardButton("Jobs", callback_data="m:jobs", icon_custom_emoji_id=EMOJI["jobs"])],
-        [InlineKeyboardButton("Set Source", callback_data="m:source", icon_custom_emoji_id=EMOJI["source"]),
-         InlineKeyboardButton("Set Target", callback_data="m:target", icon_custom_emoji_id=EMOJI["target"])],
-        [InlineKeyboardButton("Status", callback_data="m:status", icon_custom_emoji_id=EMOJI["status"]),
-         InlineKeyboardButton("Failed", callback_data="m:failed", icon_custom_emoji_id=EMOJI["failed"])],
-        [InlineKeyboardButton("Help", callback_data="m:help", icon_custom_emoji_id=EMOJI["help"])],
-        [InlineKeyboardButton("Delay", callback_data="m:delay", icon_custom_emoji_id=EMOJI["delay"])],
+        [ib("Set Artist", "m:artist", "artist", ButtonStyle.PRIMARY),
+         ib("Set Cover", "m:cover", "cover", ButtonStyle.PRIMARY)],
+        [ib("New Job", "m:new", "new", ButtonStyle.PRIMARY),
+         ib("Jobs", "m:jobs", "jobs", ButtonStyle.PRIMARY)],
+        [ib("Set Source", "m:source", "source", ButtonStyle.PRIMARY),
+         ib("Set Target", "m:target", "target", ButtonStyle.PRIMARY)],
+        [ib("Status", "m:status", "status", ButtonStyle.PRIMARY),
+         ib("Failed", "m:failed", "failed", ButtonStyle.DANGER)],
+        [ib("Help", "m:help", "help", ButtonStyle.PRIMARY)],
+        [ib("Delay", "m:delay", "delay", ButtonStyle.PRIMARY)],
+    ])
+
+def confirm_kb(kind):
+    return InlineKeyboardMarkup([
+        [ib("Confirm", f"confirm:{kind}", "start", ButtonStyle.SUCCESS),
+         ib("Cancel", f"cancel_confirm:{kind}", "cancel", ButtonStyle.DANGER)]
+    ])
+
+def global_meta_kb():
+    return InlineKeyboardMarkup([
+        [ib("Set Artist", "gm:artist", "artist", ButtonStyle.PRIMARY),
+         ib("Set Album", "gm:album", "genre", ButtonStyle.PRIMARY)],
+        [ib("Set Album Artist", "gm:album_artist", "artist", ButtonStyle.PRIMARY),
+         ib("Set Genre", "gm:genre", "genre", ButtonStyle.PRIMARY)],
+        [ib("Set Year", "gm:year", "status", ButtonStyle.PRIMARY),
+         ib("Set Comment", "gm:comment", "help", ButtonStyle.PRIMARY)],
+        [ib("Back", "gm:back", "cancel", ButtonStyle.DANGER)]
     ])
 
 def job_kb(jid):
     m = jobs[jid]["meta"]
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"Artist: {m.get('artist') or 'Not set'}", callback_data=f"s:artist:{jid}", icon_custom_emoji_id=EMOJI["artist"])],
-        [InlineKeyboardButton(f"Genre: {m.get('genre') or 'Not set'}", callback_data=f"s:genre:{jid}", icon_custom_emoji_id=EMOJI["genre"]),
-         InlineKeyboardButton("Choose", callback_data=f"genre:{jid}", icon_custom_emoji_id=EMOJI["genre"])],
-        [InlineKeyboardButton(f"Year: {m.get('year') or 'Not set'}", callback_data=f"s:year:{jid}")],
-        [InlineKeyboardButton(f"Album: {m.get('album') or 'Not set'}", callback_data=f"s:album:{jid}")],
-        [InlineKeyboardButton(f"Album Artist: {m.get('album_artist') or 'Not set'}", callback_data=f"s:album_artist:{jid}")],
-        [InlineKeyboardButton(f"Comment: {m.get('comment') or 'Not set'}", callback_data=f"s:comment:{jid}")],
-        [InlineKeyboardButton(f"Cover: {'Attached' if m.get('cover_path') else 'Not set'}", callback_data=f"cover:{jid}", icon_custom_emoji_id=EMOJI["cover"]),
-         InlineKeyboardButton("Clear", callback_data=f"clear:{jid}")],
-        [InlineKeyboardButton("START", callback_data=f"start:{jid}", icon_custom_emoji_id=EMOJI["start"]),
-         InlineKeyboardButton("Cancel", callback_data=f"cancel:{jid}", icon_custom_emoji_id=EMOJI["cancel"])],
+        [ib(f"Artist: {m.get('artist') or 'Not set'}", f"s:artist:{jid}", "artist", ButtonStyle.PRIMARY)],
+        [ib(f"Genre: {m.get('genre') or 'Not set'}", f"s:genre:{jid}", "genre", ButtonStyle.PRIMARY),
+         ib("Choose", f"genre:{jid}", "genre", ButtonStyle.PRIMARY)],
+        [ib(f"Year: {m.get('year') or 'Not set'}", f"s:year:{jid}", "status", ButtonStyle.PRIMARY)],
+        [ib(f"Album: {m.get('album') or 'Not set'}", f"s:album:{jid}", "genre", ButtonStyle.PRIMARY)],
+        [ib(f"Album Artist: {m.get('album_artist') or 'Not set'}", f"s:album_artist:{jid}", "artist", ButtonStyle.PRIMARY)],
+        [ib(f"Comment: {m.get('comment') or 'Not set'}", f"s:comment:{jid}", "help", ButtonStyle.PRIMARY)],
+        [ib(f"Cover: {'Attached' if m.get('cover_path') else 'Not set'}", f"cover:{jid}", "cover", ButtonStyle.PRIMARY),
+         ib("Clear", f"clear:{jid}", "cancel", ButtonStyle.DANGER)],
+        [ib("START", f"start:{jid}", "start", ButtonStyle.SUCCESS),
+         ib("Cancel", f"cancel:{jid}", "cancel", ButtonStyle.DANGER)],
     ])
 
 def summary(jid):
