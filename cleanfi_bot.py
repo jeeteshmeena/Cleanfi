@@ -4,6 +4,7 @@ from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.errors import FloodWait
 from pyrogram.handlers import RawUpdateHandler
+from pyrogram.file_id import FileId
 from dotenv import load_dotenv
 from mutagen import File as MFile
 from metadata import clean_and_apply_metadata, read_original_title
@@ -442,6 +443,18 @@ async def test_cmd(_, m):
     jid = await create_job(m.from_user.id, int(p[1]), int(p[1]))
     await m.reply_text(summary(jid), reply_markup=job_kb(jid))
 
+async def download_media_direct(media, path, jid):
+    """Download through Pyrogram's media generator so FloodWait is not swallowed by Message.download()."""
+    file_id = FileId.decode(media.file_id)
+    written = 0
+    with open(path, "wb") as fp:
+        async for chunk in app.get_file(file_id, file_size=getattr(media, "file_size", 0) or 0):
+            fp.write(chunk)
+            written += len(chunk)
+    if written <= 0:
+        raise RuntimeError("Telegram returned an empty media download")
+    return path
+
 async def process_file(jid, mid):
     j = jobs[jid]
     if MIN_FREE_DISK_GB and __import__("shutil").disk_usage(TEMP).free < MIN_FREE_DISK_GB * 1024**3:
@@ -457,7 +470,7 @@ async def process_file(jid, mid):
     d = TEMP / jid; d.mkdir(exist_ok=True)
     inp = d / f"{mid}_{Path(name).name}"; out = d / f"out_{mid}_{Path(name).name}"
     try:
-        await tg_call(lambda: msg.download(file_name=str(inp)), jid, "download")
+        await download_media_direct(media, str(inp), jid)
         title = read_original_title(str(inp))
         if title is None:
             try:
@@ -545,7 +558,10 @@ async def queue_worker():
 
 async def run_job(jid, ids=None):
     j = jobs[jid]
-    j["status"] = "running"; j["started_at"] = j.get("started_at") or time.time(); await save()
+    j["status"] = "running"; j["started_at"] = j.get("started_at") or time.time()
+    j["flood_until"] = 0
+    j["flood_label"] = None
+    await save()
     ids = ids if ids is not None else list(range(j["start"], j["end"]+1))
     completed = set(j["processed"]) | set(j["skipped"])
     ids = [i for i in ids if i not in completed]
@@ -564,16 +580,40 @@ async def run_job(jid, ids=None):
             if j.get("cancel_requested"): break
             j["current"] = mid; await safe_progress(jid, True)
             try:
-                result, reason = await process_file_with_retry(jid, mid)
-                if result == "ok":
+                while True:
+                    try:
+                        result, reason = await process_file_with_retry(jid, mid)
+                        break
+                    except FloodWait as e:
+                        seconds = max(1, int(e.value))
+                        j["status"] = "paused"
+                        j["flood_until"] = time.time() + seconds
+                        j["flood_label"] = "Telegram FloodWait"
+                        await save()
+                        await safe_progress(jid, True)
+                        log.warning("FloodWait on job %s for %ss; pausing job and retrying message %s after wait", jid, seconds, mid)
+                        try:
+                            await app.send_message(
+                                j["owner"],
+                                f"⏸ Job {jid} paused due to Telegram FloodWait.\nWaiting {seconds}s, then the same file will retry automatically."
+                            )
+                        except Exception:
+                            pass
+                        await asyncio.sleep(seconds + 1)
+                        j["flood_until"] = 0
+                        j["flood_label"] = None
+                        j["status"] = "running"
+                        await save()
+                        await safe_progress(jid, True)
+            except FloodWait:
+                raise
+            if result == "ok":
                     if mid not in j["processed"]: j["processed"].append(mid)
                 elif result == "skip":
                     if mid not in j["skipped"]: j["skipped"].append(mid)
                 else:
                     if mid not in j["failed"]: j["failed"].append(mid)
                     j["failed_reasons"][str(mid)] = reason or "unknown"
-            except FloodWait:
-                continue
             except Exception as e:
                 if mid not in j["failed"]: j["failed"].append(mid)
                 j["failed_reasons"][str(mid)] = f"{type(e).__name__}: {e}"
