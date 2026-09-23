@@ -172,13 +172,21 @@ def progress_text(jid):
             f"Speed: {speed:.1f} files/min\nElapsed: {int(elapsed//60)}m {int(elapsed%60)}s\n"
             f"ETA: {int(eta//60)}m {int(eta%60)}s\nFloodWait: {flood_text(jid)}")
 
+def custom_emoji(emoji_id):
+    return f"<tg-emoji emoji-id=\"{emoji_id}\">🙂</tg-emoji>"
+
+E = {"artist":5373334855612375386,"cover":5424892643760936970,"new":5373026167722876724,"jobs":5372926953978341366,
+     "source":5471978009449731768,"target":5472105307985419058,"status":5370771949842602821,"failed":5370987174948771923,
+     "help":5370738629486319646,"delay":5451732530041955576}
+
 def main_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("New Job", callback_data="m:new"), InlineKeyboardButton("Jobs", callback_data="m:jobs")],
-        [InlineKeyboardButton("Source", callback_data="m:source"), InlineKeyboardButton("▸ Target", callback_data="m:target")],
-        [InlineKeyboardButton("Status", callback_data="m:status"), InlineKeyboardButton("✧ Failed", callback_data="m:failed")],
-        [InlineKeyboardButton("Delay", callback_data="m:delay")],
-        [InlineKeyboardButton("Help", callback_data="m:help")],
+        [InlineKeyboardButton(f"{custom_emoji(E['artist'])} Set Artist", callback_data="m:artist"), InlineKeyboardButton(f"{custom_emoji(E['cover'])} Set Cover", callback_data="m:cover")],
+        [InlineKeyboardButton(f"{custom_emoji(E['new'])} New Job", callback_data="m:new"), InlineKeyboardButton(f"{custom_emoji(E['jobs'])} Jobs", callback_data="m:jobs")],
+        [InlineKeyboardButton(f"{custom_emoji(E['source'])} Set Source", callback_data="m:source"), InlineKeyboardButton(f"{custom_emoji(E['target'])} Set Target", callback_data="m:target")],
+        [InlineKeyboardButton(f"{custom_emoji(E['status'])} Status", callback_data="m:status"), InlineKeyboardButton(f"{custom_emoji(E['failed'])} Failed", callback_data="m:failed")],
+        [InlineKeyboardButton(f"{custom_emoji(E['help'])} Help", callback_data="m:help")],
+        [InlineKeyboardButton(f"{custom_emoji(E['delay'])} Delay", callback_data="m:delay")],
     ])
 
 def job_kb(jid):
@@ -191,12 +199,12 @@ def job_kb(jid):
         [InlineKeyboardButton(f"Album Artist: {m.get('album_artist') or '—'}", callback_data=f"s:album_artist:{jid}")],
         [InlineKeyboardButton(f"Comment: {m.get('comment') or '—'}", callback_data=f"s:comment:{jid}")],
         [InlineKeyboardButton(f"Cover: {'Attached' if m.get('cover_path') else 'Not set'}", callback_data=f"cover:{jid}"), InlineKeyboardButton("Clear", callback_data=f"clear:{jid}")],
-        [InlineKeyboardButton("✦ START", callback_data=f"start:{jid}"), InlineKeyboardButton("Cancel", callback_data=f"cancel:{jid}")],
+        [InlineKeyboardButton("START", callback_data=f"start:{jid}"), InlineKeyboardButton("Cancel", callback_data=f"cancel:{jid}")],
     ])
 
 def summary(jid):
     j = jobs[jid]; m = j["meta"]
-    return (f"✦ Cleanfi Job {jid}\nRange: {j['start']} → {j['end']}\nStatus: {j['status']}\n"
+    return (f"Cleanfi Job {jid}\nRange: {j['start']} → {j['end']}\nStatus: {j['status']}\n"
             f"Source: {j.get('source') or 'Not set'}\nTarget: {j.get('target') or 'Not set'}\n\n"
             f"Artist: {m.get('artist') or '—'}\nGenre: {m.get('genre') or '—'}\nYear: {m.get('year') or '—'}\n"
             f"Album: {m.get('album') or '—'}\nAlbum Artist: {m.get('album_artist') or '—'}\n"
@@ -303,7 +311,7 @@ async def source_cmd(_, m):
     if len(p) != 2: return await m.reply_text("Usage: /source @channelusername")
     try:
         c = await resolve_chat(p[1]); settings["source"] = str(c.id); await save()
-        await m.reply_text(f"✦ Source set\n{c.title or c.first_name}\nID: {c.id}", reply_markup=main_kb())
+        await m.reply_text(f" Source set\n{c.title or c.first_name}\nID: {c.id}", reply_markup=main_kb())
     except Exception as e: await m.reply_text(f"Could not set source: {type(e).__name__}: {e}")
 
 @app.on_message(filters.private & filters.command("target"))
