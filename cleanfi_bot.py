@@ -235,8 +235,9 @@ def job_kb(jid):
         [ib(f"Album: {m.get('album') or 'Not set'}", f"s:album:{jid}", "genre", ButtonStyle.PRIMARY)],
         [ib(f"Album Artist: {m.get('album_artist') or 'Not set'}", f"s:album_artist:{jid}", "artist", ButtonStyle.PRIMARY)],
         [ib(f"Comment: {m.get('comment') or 'Not set'}", f"s:comment:{jid}", "help", ButtonStyle.PRIMARY)],
-        [ib(f"Cover: {'Attached' if m.get('cover_path') else 'Not set'}", f"cover:{jid}", "cover", ButtonStyle.PRIMARY),
-         ib("Clear", f"clear:{jid}", "cancel", ButtonStyle.DANGER)],
+        [ib(f"Start Post: {'Set' if jobs[jid].get('start_post', {}).get('image_path') else 'Not set'}", f"startpost:{jid}", "cover", ButtonStyle.PRIMARY),
+         ib(f"Cover: {'Attached' if m.get('cover_path') else 'Not set'}", f"cover:{jid}", "cover", ButtonStyle.PRIMARY)],
+        [ib("Clear Cover", f"clear:{jid}", "cancel", ButtonStyle.DANGER)],
         [ib("START", f"start:{jid}", "start", ButtonStyle.SUCCESS),
          ib("CANCEL JOB", f"cancel:{jid}", "cancel", ButtonStyle.DANGER)],
         [ib("Refresh", f"refresh:{jid}", "status", ButtonStyle.PRIMARY)],
@@ -304,9 +305,26 @@ async def post_start(jid):
     if not Path(path).is_file():
         log.warning("Start post image missing for job %s: %s", jid, path)
         return False
-    await tg_call(lambda: app.send_photo(int(j["target"]), photo=path, caption=caption), jid, "start post")
+    sent = await tg_call(
+        lambda: app.send_photo(int(j["target"]), photo=path, caption=caption),
+        jid, "start post"
+    )
+    post["message_id"] = sent.id
     post["sent"] = True
     await save()
+    try:
+        await tg_call(
+            lambda: app.pin_chat_message(int(j["target"]), int(sent.id), disable_notification=True),
+            jid, "pin start post"
+        )
+        post["pinned"] = True
+        await save()
+        log.info("Start post sent and pinned: job=%s message=%s target=%s", jid, sent.id, j["target"])
+    except Exception:
+        post["pinned"] = False
+        await save()
+        log.exception("Could not pin start post for job %s", jid)
+        raise
     return True
 
 async def post_end(jid):
@@ -415,7 +433,11 @@ async def startpost_photo(_, m):
     jobs[jid]["start_post"] = {"image_path": str(path), "caption": caption, "sent": False}
     sessions.pop((m.from_user.id, "startpost"), None)
     await save()
-    await m.reply_text(f"Start post saved for job {jid}.\nCaption: {caption}")
+    await m.reply_text(
+        f"Start post saved successfully for Job {jid}.\nCaption: {caption}\n\n"
+        "When this job starts, Cleanfi will send this image to the target channel and pin it automatically.",
+        reply_markup=job_kb(jid)
+    )
     m.stop_propagation()
 
 @app.on_message(filters.private & filters.command("batch"))
@@ -915,6 +937,17 @@ async def callbacks(_, q: CallbackQuery):
         log.info("CANCEL requested user=%s job=%s status=%s", q.from_user.id, jid, j["status"])
         await q.answer("Cancellation requested")
         return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
+    if action == "startpost":
+        j = jobs[jid]
+        if j.get("status") in {"running", "queued"}:
+            return await q.answer("Set the start post before starting the job.", show_alert=True)
+        sessions[q.from_user.id] = jid
+        sessions[(q.from_user.id, "startpost")] = True
+        await q.answer()
+        return await q.message.reply_text(
+            f"Send the start image for Job {jid} with the story name as its caption.\n"
+            "When the job starts, Cleanfi will send this image to the target channel and pin it automatically."
+        )
     if action == "clear": jobs[jid]["meta"]["cover_path"] = None; await save(); return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
     if action == "cover": return await q.answer(f"Send image with caption /cover {jid}", show_alert=True)
     if action == "genre":
