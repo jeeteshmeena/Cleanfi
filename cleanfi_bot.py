@@ -166,19 +166,19 @@ def progress_text(jid):
     eta = ((total-done) / speed * 60) if speed else 0
     current = j.get("current")
     cur = f"\nCurrent: #{current}" if current else ""
-    return (f"✦ Cleanfi Processing\nJob: {jid}{cur}\n\n{bar} {pct}%\n"
-            f"Files: {done} / {total}\n✓ Processed: {len(j['processed'])}\n"
-            f"✗ Failed: {len(j['failed'])}\n⊘ Skipped: {len(j['skipped'])}\n"
+    return (f"Cleanfi Processing\nJob: {jid}{cur}\n\n{bar} {pct}%\n"
+            f"Files: {done} / {total}\nProcessed: {len(j['processed'])}\n"
+            f"Failed: {len(j['failed'])}\nSkipped: {len(j['skipped'])}\n"
             f"Speed: {speed:.1f} files/min\nElapsed: {int(elapsed//60)}m {int(elapsed%60)}s\n"
             f"ETA: {int(eta//60)}m {int(eta%60)}s\nFloodWait: {flood_text(jid)}")
 
 def main_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✦ New Job", callback_data="m:new"), InlineKeyboardButton("◈ Jobs", callback_data="m:jobs")],
-        [InlineKeyboardButton("▸ Source", callback_data="m:source"), InlineKeyboardButton("▸ Target", callback_data="m:target")],
-        [InlineKeyboardButton("✧ Status", callback_data="m:status"), InlineKeyboardButton("✧ Failed", callback_data="m:failed")],
-        [InlineKeyboardButton("⏱ Delay", callback_data="m:delay")],
-        [InlineKeyboardButton("❖ Help", callback_data="m:help")],
+        [InlineKeyboardButton("New Job", callback_data="m:new"), InlineKeyboardButton("Jobs", callback_data="m:jobs")],
+        [InlineKeyboardButton("Source", callback_data="m:source"), InlineKeyboardButton("▸ Target", callback_data="m:target")],
+        [InlineKeyboardButton("Status", callback_data="m:status"), InlineKeyboardButton("✧ Failed", callback_data="m:failed")],
+        [InlineKeyboardButton("Delay", callback_data="m:delay")],
+        [InlineKeyboardButton("Help", callback_data="m:help")],
     ])
 
 def job_kb(jid):
@@ -202,6 +202,30 @@ def summary(jid):
             f"Album: {m.get('album') or '—'}\nAlbum Artist: {m.get('album_artist') or '—'}\n"
             f"Comment: {m.get('comment') or '—'}\nCover: {'Attached' if m.get('cover_path') else 'Not attached'}\n"
             f"Title: Original source title\nDelay: {get_delay(jid)}s between episodes\n\nProcessed: {len(j['processed'])}/{j['total']} | Failed: {len(j['failed'])} | Skipped: {len(j['skipped'])}")
+
+async def create_batch_job(owner, first_link, end_link):
+    jid = uuid.uuid4().hex[:8]
+    jobs[jid] = {"id": jid, "owner": owner, "first_link": first_link, "end_link": end_link, "start": None, "end": None,
+                 "total": 0, "processed": [], "failed": [], "failed_reasons": {}, "skipped": [], "status": "configured",
+                 "cancel_requested": False, "meta": newmeta(), "source": settings["source"], "target": settings["target"],
+                 "created": time.time(), "started_at": None, "progress_message_id": None, "current": None,
+                 "flood_until": 0, "queue_ids": None, "delay_seconds": int(settings.get("file_delay", DEFAULT_DELAY_SECONDS)),
+                 "start_post": {"image_path": None, "caption": None, "sent": False}, "end_post_sent": False}
+    sessions[owner] = jid
+    await save()
+    return jid
+
+async def fetch_batch_ids(jid):
+    j = jobs[jid]
+    first = await tg_call(lambda: app.get_messages(int(j["source"]), int(j["first_link"].rstrip("/").split("/")[-1])), jid, "batch first link")
+    end = await tg_call(lambda: app.get_messages(int(j["source"]), int(j["end_link"].rstrip("/").split("/")[-1])), jid, "batch end link")
+    first_id, end_id = first.id, end.id
+    if first_id > end_id: first_id, end_id = end_id, first_id
+    j["start"], j["end"] = first_id, end_id
+    j["total"] = end_id - first_id + 1
+    j["queue_ids"] = list(range(first_id, end_id + 1))
+    await save()
+    return j["queue_ids"]
 
 async def create_job(owner, start, end):
     jid = uuid.uuid4().hex[:8]
@@ -265,12 +289,12 @@ async def menu_cmd(_, m):
 @app.on_message(filters.private & filters.command("start"))
 async def start_cmd(_, m):
     if allowed(m):
-        await m.reply_text("✦ CLEANFI\n\nAudiobook metadata cleaner & repacker.", reply_markup=main_kb())
+        await m.reply_text("CLEANFI\n\nAudiobook metadata cleaner & repacker.", reply_markup=main_kb())
 
 @app.on_message(filters.private & filters.command("help"))
 async def help_cmd(_, m):
     if allowed(m):
-        await m.reply_text("✦ CLEANFI\n\n/range START END\n/source @channel\n/target @channel\n/meta artist=\"Name\" genre=\"Romance\" year=2026\n/cover JOBID\n/startjob JOBID\n/status JOBID\n/delay SECONDS\n/cancel JOBID\n/retry JOBID\n/failed JOBID\n/test MESSAGE_ID\n/jobs", reply_markup=main_kb())
+        await m.reply_text("CLEANFI\n\n/range START END\n/source @channel\n/target @channel\n/meta artist=\"Name\" genre=\"Romance\" year=2026\n/cover JOBID\n/startjob JOBID\n/status JOBID\n/delay SECONDS\n/cancel JOBID\n/retry JOBID\n/failed JOBID\n/test MESSAGE_ID\n/jobs", reply_markup=main_kb())
 
 @app.on_message(filters.private & filters.command("source"))
 async def source_cmd(_, m):
@@ -346,6 +370,15 @@ async def startpost_photo(_, m):
     await m.reply_text(f"Start post saved for job {jid}.\nCaption: {caption}")
     m.stop_propagation()
 
+@app.on_message(filters.private & filters.command("batch"))
+async def batch_cmd(_, m):
+    if not allowed(m): return
+    if not settings.get("source") or not settings.get("target"):
+        return await m.reply_text("Set /source and /target first.")
+    jid = await create_batch_job(m.from_user.id, "", "")
+    sessions[(m.from_user.id, "batch_first")] = jid
+    await m.reply_text("Batch Mode\n\nSend me the first audio post link (e.g., https://t.me/channel/123).")
+
 @app.on_message(filters.private & filters.command("range"))
 async def range_cmd(_, m):
     if not allowed(m): return
@@ -369,6 +402,24 @@ async def globalmeta_cmd(_, m):
         if k in {"artist","genre","year","album","album_artist","comment"}: g[k] = a or b or c
     await save()
     await m.reply_text("Global metadata saved. New jobs will inherit these values.")
+
+@app.on_message(filters.private & filters.text)
+async def batch_link_input(_, m):
+    if not allowed(m): return
+    text = (m.text or "").strip()
+    if not text.startswith("https://t.me/"): return
+    jid = sessions.get((m.from_user.id, "batch_first")) or sessions.get((m.from_user.id, "batch_end"))
+    if not jid or jid not in jobs: return
+    if sessions.get((m.from_user.id, "batch_first")) == jid:
+        jobs[jid]["first_link"] = text
+        sessions.pop((m.from_user.id, "batch_first"), None)
+        sessions[(m.from_user.id, "batch_end")] = jid
+        await save()
+        return await m.reply_text("Batch Mode\n\nSend me the end audio post link (e.g., https://t.me/channel/123).")
+    jobs[jid]["end_link"] = text
+    sessions.pop((m.from_user.id, "batch_end"), None)
+    await save()
+    await m.reply_text("Batch configured. Press START to fetch all source messages and begin.", reply_markup=job_kb(jid))
 
 @app.on_message(filters.private & filters.command("meta"))
 async def meta_cmd(_, m):
@@ -526,6 +577,8 @@ async def process_file_with_retry(jid, mid):
 
 async def launch(jid, m, ids=None):
     global job_queue, queue_task
+    if not ids and jobs[jid].get("first_link") and jobs[jid].get("end_link"):
+        ids = await fetch_batch_ids(jid)
     if jid in running or jid in queued_jobs:
         return await m.reply_text(f"Job {jid} is already running or queued.")
     if len(queued_jobs) >= MAX_QUEUE:
@@ -612,7 +665,7 @@ async def run_job(jid, ids=None):
                         try:
                             await app.send_message(
                                 j["owner"],
-                                f"⏸ Job {jid} paused due to Telegram FloodWait.\nWaiting {seconds}s, then the same file will retry automatically."
+                                f"Job {jid} paused due to Telegram FloodWait.\nWaiting {seconds}s, then the same file will retry automatically."
                             )
                         except Exception:
                             pass
@@ -663,7 +716,7 @@ async def callbacks(_, q: CallbackQuery):
     parts = q.data.split(":"); action = parts[0]
     if action == "m":
         sub = parts[1]
-        if sub == "new": await q.answer(); return await q.message.reply_text("Use /range START END to create a job.")
+        if sub == "new": await q.answer(); return await q.message.reply_text("Use /batch to create a batch.")
         if sub == "jobs": await q.answer(); return await q.message.reply_text("Use /jobs for recent jobs.")
         if sub == "source": await q.answer("Use /source @channelusername", show_alert=True); return
         if sub == "target": await q.answer("Use /target @channelusername", show_alert=True); return
