@@ -427,8 +427,40 @@ async def cover_media(_, m):
     if not allowed(m):
         return
     log.info("COVER MEDIA RECEIVED user=%s type=%s global=%s job=%s active=%s", m.from_user.id, "photo" if m.photo else "document", bool(sessions.get((m.from_user.id, "global_cover"))), bool(sessions.get((m.from_user.id, "job_cover"))), sessions.get(m.from_user.id))
+    # Start-post capture: preserve BOTH the image and its caption.
     if sessions.get((m.from_user.id, "startpost")):
-        return
+        jid = sessions.get(m.from_user.id)
+        if not jid or jid not in jobs:
+            sessions.pop((m.from_user.id, "startpost"), None)
+            return await m.reply_text("That job is no longer available. Open the job again and use Start Post.")
+        if m.photo:
+            image = m.photo
+        elif m.document and (m.document.mime_type or "").startswith("image/"):
+            image = m.document
+        else:
+            return await m.reply_text("Please send an image for the Start Post.")
+        d = TEMP / jid
+        d.mkdir(exist_ok=True)
+        path = d / "start_post.jpg"
+        try:
+            await tg_call(lambda: m.download(file_name=str(path)), jid, "start post download")
+            jobs[jid]["start_post"] = {
+                "image_path": str(path),
+                "caption": m.caption or "",
+                "sent": False,
+            }
+            sessions.pop((m.from_user.id, "startpost"), None)
+            sessions[m.from_user.id] = jid
+            await save()
+            log.info("START POST SAVED user=%s job=%s path=%s caption=%r", m.from_user.id, jid, path, m.caption or "")
+            return await m.reply_text(
+                f"Start Post saved successfully for Job {jid}.\n"
+                "The image and caption will be sent to the target channel when the job starts and the post will be pinned.",
+                reply_markup=job_kb(jid)
+            )
+        except Exception as e:
+            log.exception("START POST SAVE FAILED user=%s job=%s", m.from_user.id, jid)
+            return await m.reply_text(f"Start Post save failed: {type(e).__name__}: {e}", reply_markup=job_kb(jid))
     if m.document and not (m.document.mime_type or "").startswith("image/"):
         return
     if sessions.get((m.from_user.id, "global_cover")):
