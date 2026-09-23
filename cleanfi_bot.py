@@ -297,15 +297,15 @@ async def post_end(jid):
     await save()
 
 
-@app.on_callback_query()
-async def callbacks(_, q: CallbackQuery):(_, m):
+@app.on_message(filters.private & filters.text, group=-100)
+async def entry_fallback(_, m):
     text = (m.text or "").strip().split(maxsplit=1)[0].lower()
     if text not in ("/start", "/menu"):
         return
     log.info("Incoming %s from user=%s", text, m.from_user.id if m.from_user else None)
     if not allowed(m):
         return
-    await m.reply_text("CLEANFI\n\nAudiobook metadata cleaner & repacker.", reply_markup=main_kb())
+    await m.reply_text("Welcome to Cleanfi\n\nCleanfi is ready to process your stories.", reply_markup=main_kb())
     m.stop_propagation()
 
 @app.on_message(filters.private & filters.command("menu"))
@@ -751,6 +751,7 @@ async def run_job(jid, ids=None):
             except Exception:
                 pass
 
+@app.on_callback_query()
 async def callbacks(_, q: CallbackQuery):
     if not q.from_user or q.from_user.id not in ADMINS:
         return await q.answer("Not authorized", show_alert=True)
