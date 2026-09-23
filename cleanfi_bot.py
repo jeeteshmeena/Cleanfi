@@ -1,8 +1,9 @@
-import os, re, json, asyncio, time, uuid
+import os, re, json, asyncio, time, uuid, logging
 from pathlib import Path
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.errors import FloodWait
+from pyrogram.handlers import RawUpdateHandler
 from dotenv import load_dotenv
 from mutagen import File as MFile
 from metadata import clean_and_apply_metadata, read_original_title
@@ -16,11 +17,15 @@ TEMP = Path(os.getenv("TEMP_DIR", "./tmp")); TEMP.mkdir(parents=True, exist_ok=T
 STATE = Path(os.getenv("STATE_FILE", "./jobs.json"))
 FILE_DELAY = max(3, int(os.getenv("FILE_DELAY_SECONDS", "3")))
 MAX_QUEUE = max(1, int(os.getenv("MAX_QUEUED_JOBS", "20")))
+DEFAULT_RETRIES = max(0, int(os.getenv("TRANSIENT_RETRIES", "5")))
+MIN_FREE_DISK_GB = max(0, int(os.getenv("MIN_FREE_DISK_GB", "2")))
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+log = logging.getLogger("cleanfi")
 
 app = Client("cleanfi", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 jobs, settings, sessions, running = {}, {}, {}, {}
-state_lock = asyncio.Lock()
-tg_lock = asyncio.Lock()
+state_lock = None
+tg_lock = None
 flood_until = 0.0
 job_queue = None
 queue_task = None
@@ -33,6 +38,9 @@ def save_sync():
     tmp.replace(STATE)
 
 async def save():
+    global state_lock
+    if state_lock is None:
+        state_lock = asyncio.Lock()
     async with state_lock:
         await asyncio.to_thread(save_sync)
 
@@ -46,6 +54,8 @@ def load():
         settings, jobs = {}, {}
     settings.setdefault("source", os.getenv("SOURCE_CHAT_ID", ""))
     settings.setdefault("target", os.getenv("TARGET_CHAT_ID", ""))
+    settings.setdefault("retries", DEFAULT_RETRIES)
+    settings.setdefault("min_free_gb", MIN_FREE_DISK_GB)
     for j in jobs.values():
         j.setdefault("source", settings["source"]); j.setdefault("target", settings["target"])
         j.setdefault("processed", []); j.setdefault("failed", []); j.setdefault("skipped", [])
@@ -54,6 +64,7 @@ def load():
         j.setdefault("current", None); j.setdefault("flood_until", 0)
         if j.get("status") in {"running", "queued", "cancelling"}:
             j["status"] = "paused"
+        j.setdefault("retries", 0)
 
 def allowed(m):
     return bool(m.from_user and m.from_user.id in ADMINS)
@@ -65,6 +76,14 @@ def getjid(m):
     p = (m.text or "").split()
     return p[1] if len(p) > 1 and p[1] in jobs else active(m)
 
+def infer_name(media):
+    name = getattr(media, "file_name", None) or ""
+    if name:
+        return name
+    mime = (getattr(media, "mime_type", None) or "").lower()
+    ext = {"audio/mpeg": ".mp3", "audio/mp4": ".m4a", "audio/flac": ".flac", "audio/ogg": ".ogg", "audio/opus": ".opus", "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/aac": ".aac", "audio/x-ms-wma": ".wma"}.get(mime, ".bin")
+    return f"message_{getattr(media, 'file_id', 'unknown')}{ext}"
+
 def newmeta():
     return {"title_mode": "original", "artist": None, "genre": None, "year": None,
             "album": None, "album_artist": None, "comment": None, "cover_path": None}
@@ -73,7 +92,9 @@ async def tg_call(fn, jid=None, label="Telegram"):
     """Single-flight Telegram call with infinite FloodWait retry.
     FloodWait is never converted into a failed file.
     """
-    global flood_until
+    global flood_until, tg_lock
+    if tg_lock is None:
+        tg_lock = asyncio.Lock()
     while True:
         async with tg_lock:
             try:
@@ -176,6 +197,27 @@ async def create_job(owner, start, end):
     sessions[owner] = jid
     await save()
     return jid
+
+async def raw_update(_, update, users, chats):
+    log.info("RAW TELEGRAM UPDATE: %s", type(update).__name__)
+
+app.add_handler(RawUpdateHandler(raw_update), group=-1000)
+
+@app.on_message(filters.private & filters.text, group=-100)
+async def entry_fallback(_, m):
+    text = (m.text or "").strip().split(maxsplit=1)[0].lower()
+    if text not in ("/start", "/menu"):
+        return
+    log.info("Incoming %s from user=%s", text, m.from_user.id if m.from_user else None)
+    if not allowed(m):
+        return
+    await m.reply_text("CLEANFI\n\nAudiobook metadata cleaner & repacker.", reply_markup=main_kb())
+    m.stop_propagation()
+
+@app.on_message(filters.private & filters.command("menu"))
+async def menu_cmd(_, m):
+    if allowed(m):
+        await m.reply_text("CLEANFI", reply_markup=main_kb())
 
 @app.on_message(filters.private & filters.command("start"))
 async def start_cmd(_, m):
@@ -308,13 +350,16 @@ async def test_cmd(_, m):
 
 async def process_file(jid, mid):
     j = jobs[jid]
+    if MIN_FREE_DISK_GB and __import__("shutil").disk_usage(TEMP).free < MIN_FREE_DISK_GB * 1024**3:
+        return "failed", f"Low disk space: less than {MIN_FREE_DISK_GB} GB free"
     msg = await tg_call(lambda: app.get_messages(int(j["source"]), mid), jid, "get_messages")
     media = msg.audio or (msg.document if msg.document and (getattr(msg.document, "mime_type", "") or "").startswith("audio/") else None)
     if not media: return "skip", "message has no audio media"
-    name = getattr(media, "file_name", None) or f"message_{mid}.bin"
+    name = infer_name(media)
     ext = Path(name).suffix.lower()
     supported = {".mp3",".m4a",".mp4",".flac",".ogg",".opus",".wav",".aiff",".aif",".wma",".aac"}
     if ext not in supported: return "skip", f"unsupported container {ext or 'unknown'}"
+    if ext == ".aac": return "skip", "raw AAC has no portable metadata container"
     d = TEMP / jid; d.mkdir(exist_ok=True)
     inp = d / f"{mid}_{Path(name).name}"; out = d / f"out_{mid}_{Path(name).name}"
     try:
@@ -468,6 +513,7 @@ async def field_input(_, m):
 
 def main():
     load()
+    log.info("Starting Cleanfi Telegram client...")
     app.run()
 
 if __name__ == "__main__":
