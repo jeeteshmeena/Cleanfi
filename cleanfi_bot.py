@@ -15,12 +15,14 @@ load_dotenv()
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMINS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
+ADMIN_IDS_LIST = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+ADMINS = set(ADMIN_IDS_LIST)
+OWNER_ID = int(os.getenv("OWNER_ID", str(ADMIN_IDS_LIST[0] if ADMIN_IDS_LIST else 0)))
 TEMP = Path(os.getenv("TEMP_DIR", "./tmp")); TEMP.mkdir(parents=True, exist_ok=True)
 STATE = Path(os.getenv("STATE_FILE", "./jobs.json"))
-MIN_DELAY_SECONDS = 3
+MIN_DELAY_SECONDS = 12
 MAX_DELAY_SECONDS = 60
-DEFAULT_DELAY_SECONDS = min(MAX_DELAY_SECONDS, max(MIN_DELAY_SECONDS, int(os.getenv("FILE_DELAY_SECONDS", "3"))))
+DEFAULT_DELAY_SECONDS = min(MAX_DELAY_SECONDS, max(MIN_DELAY_SECONDS, int(os.getenv("FILE_DELAY_SECONDS", "12"))))
 MAX_QUEUE = max(1, int(os.getenv("MAX_QUEUED_JOBS", "20")))
 DEFAULT_RETRIES = max(0, int(os.getenv("TRANSIENT_RETRIES", "5")))
 MIN_FREE_DISK_GB = max(0, int(os.getenv("MIN_FREE_DISK_GB", "2")))
@@ -40,6 +42,8 @@ queued_jobs = set()
 # counted as a waiting position, but remains the active job ahead of the queue.)
 queue_order = []
 job_tasks = {}
+live_queue = None
+live_task = None
 
 
 def save_sync():
@@ -63,6 +67,11 @@ def load():
     except Exception:
         settings, jobs = {}, {}
     settings.setdefault("source", os.getenv("SOURCE_CHAT_ID", ""))
+    settings.setdefault("authorized_users", sorted(ADMINS))
+    settings["authorized_users"] = sorted({int(x) for x in settings.get("authorized_users", [])} | ADMINS)
+    settings.setdefault("live", {"status": "stopped", "meta": {}, "stats": {"files_sent": 0, "bytes_downloaded": 0, "bytes_uploaded": 0}})
+    if settings["live"].get("status") in {"running", "paused"}:
+        settings["live"]["status"] = "stopped"
     settings.setdefault("target", os.getenv("TARGET_CHAT_ID", ""))
     settings.setdefault("retries", DEFAULT_RETRIES)
     settings.setdefault("file_delay", DEFAULT_DELAY_SECONDS)
@@ -83,7 +92,13 @@ def load():
         j.setdefault("stats", {"files_sent": len(j.get("processed", [])), "bytes_downloaded": 0, "bytes_uploaded": 0, "started_at": j.get("started_at"), "finished_at": None})
 
 def allowed(m):
-    return bool(m.from_user and m.from_user.id in ADMINS)
+    return bool(m.from_user and (m.from_user.id in ADMINS or m.from_user.id in settings.get("authorized_users", [])))
+
+def is_owner(m):
+    return bool(m.from_user and m.from_user.id == OWNER_ID)
+
+def authorized_users():
+    return sorted({int(x) for x in settings.get("authorized_users", [])})
 
 def active(m):
     return sessions.get(m.from_user.id)
@@ -603,11 +618,11 @@ async def download_media_direct(media, path, jid):
         jobs[jid].setdefault("stats", {})["bytes_downloaded"] = jobs[jid].get("stats", {}).get("bytes_downloaded", 0) + written
     return path
 
-async def process_file(jid, mid):
+async def process_file(jid, mid, message=None):
     j = jobs[jid]
     if MIN_FREE_DISK_GB and __import__("shutil").disk_usage(TEMP).free < MIN_FREE_DISK_GB * 1024**3:
         return "failed", f"Low disk space: less than {MIN_FREE_DISK_GB} GB free"
-    msg = await tg_call(lambda: app.get_messages(int(j["source"]), mid), jid, "get_messages")
+    msg = message or await tg_call(lambda: app.get_messages(int(j["source"]), mid), jid, "get_messages")
     media = msg.audio or (msg.document if msg.document and (getattr(msg.document, "mime_type", "") or "").startswith("audio/") else None)
     if not media: return "skip", "message has no audio media"
     name = infer_name(media)
@@ -643,11 +658,11 @@ async def process_file(jid, mid):
             try: p.unlink()
             except FileNotFoundError: pass
 
-async def process_file_with_retry(jid, mid):
+async def process_file_with_retry(jid, mid, message=None):
     attempt = 0
     while True:
         try:
-            return await process_file(jid, mid)
+            return await process_file(jid, mid, message=message)
         except FloodWait:
             raise
         except Exception:
