@@ -72,6 +72,10 @@ def load():
     settings.setdefault("live", {"status": "stopped", "meta": {}, "stats": {"files_sent": 0, "bytes_downloaded": 0, "bytes_uploaded": 0}})
     if settings["live"].get("status") in {"running", "paused"}:
         settings["live"]["status"] = "stopped"
+    jobs.setdefault("__live__", {"id":"__live__","owner":OWNER_ID,"source":settings["source"],"target":settings["target"],"start":0,"end":0,"total":0,"processed":[],"failed":[],"skipped":[],"failed_reasons":{},"status":"stopped","cancel_requested":False,"meta":settings["live"].get("meta") or {},"delay_seconds":int(settings.get("file_delay", DEFAULT_DELAY_SECONDS)),"stats":settings["live"].get("stats", {"files_sent":0,"bytes_downloaded":0,"bytes_uploaded":0}),"current":None})
+    if not jobs["__live__"]["meta"]:
+        jobs["__live__"]["meta"] = newmeta()
+    settings["live"]["meta"] = jobs["__live__"]["meta"]
     settings.setdefault("target", os.getenv("TARGET_CHAT_ID", ""))
     settings.setdefault("retries", DEFAULT_RETRIES)
     settings.setdefault("file_delay", DEFAULT_DELAY_SECONDS)
