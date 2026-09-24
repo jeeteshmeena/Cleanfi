@@ -245,6 +245,7 @@ def main_kb():
          ib("Set Target", "m:target", "target", ButtonStyle.PRIMARY)],
         [ib("Delay", "m:delay", "delay", ButtonStyle.PRIMARY),
          ib("New Job", "m:new", "new", ButtonStyle.SUCCESS)],
+        [ib("Live Cleaner", "m:live", "start", ButtonStyle.SUCCESS), ib("Users", "m:users", "status", ButtonStyle.PRIMARY)],
         [ib("Jobs", "m:jobs", "jobs", ButtonStyle.PRIMARY), ib("Stats", "m:stats", "status", ButtonStyle.PRIMARY)],
         [ib("Status", "m:status", "status", ButtonStyle.PRIMARY),
          ib("Failed", "m:failed", "failed", ButtonStyle.DANGER)],
@@ -404,6 +405,30 @@ async def start_cmd(_, m):
 async def help_cmd(_, m):
     if allowed(m):
         await m.reply_text("CLEANFI\n\n/range START END\n/source @channel\n/target @channel\n/meta artist=\"Name\" genre=\"Romance\" year=2026\n/cover JOBID\n/startjob JOBID\n/status JOBID\n/delay SECONDS\n/cancel JOBID\n/retry JOBID\n/failed JOBID\n/test MESSAGE_ID\n/jobs", reply_markup=main_kb())
+
+@app.on_message(filters.private & filters.command("adduser"))
+async def adduser_cmd(_, m):
+    if not is_owner(m): return
+    p = (m.text or "").split(maxsplit=1)
+    if len(p) != 2 or not re.fullmatch(r"\d+", p[1]): return await m.reply_text("Usage: /adduser USER_ID")
+    uid = int(p[1]); users = set(authorized_users()); users.add(uid); settings["authorized_users"] = sorted(users); await save()
+    await m.reply_text(f"User {uid} added successfully.", reply_markup=main_kb())
+
+@app.on_message(filters.private & filters.command("deluser"))
+async def deluser_cmd(_, m):
+    if not is_owner(m): return
+    p = (m.text or "").split(maxsplit=1)
+    if len(p) != 2 or not re.fullmatch(r"\d+", p[1]): return await m.reply_text("Usage: /deluser USER_ID")
+    uid = int(p[1])
+    if uid == OWNER_ID: return await m.reply_text("Owner cannot be removed.")
+    users = set(authorized_users()); users.discard(uid); settings["authorized_users"] = sorted(users); await save()
+    await m.reply_text(f"User {uid} removed.", reply_markup=main_kb())
+
+@app.on_message(filters.private & filters.command("users"))
+async def users_cmd(_, m):
+    if not is_owner(m): return
+    users = authorized_users()
+    await m.reply_text("Authorized Users\n\n" + ("\n".join(str(x) for x in users) or "No users."), reply_markup=main_kb())
 
 @app.on_message(filters.private & filters.command("source"))
 async def source_cmd(_, m):
@@ -941,7 +966,7 @@ async def run_job(jid, ids=None):
 
 @app.on_callback_query()
 async def callbacks(_, q: CallbackQuery):
-    if not q.from_user or q.from_user.id not in ADMINS:
+    if not q.from_user or not (q.from_user.id in ADMINS or q.from_user.id in settings.get("authorized_users", [])):
         return await q.answer("Not authorized", show_alert=True)
     parts = q.data.split(":"); action = parts[0]
     log.info("CALLBACK user=%s data=%s", q.from_user.id, q.data)
@@ -949,6 +974,11 @@ async def callbacks(_, q: CallbackQuery):
     if action == "m":
         sub = parts[1]
         await q.answer()
+        if sub == "users":
+            if q.from_user.id != OWNER_ID: return await q.answer("Owner only", show_alert=True)
+            return await q.message.reply_text("Authorized Users\n\n" + "\n".join(str(x) for x in authorized_users()), reply_markup=main_kb())
+        if sub == "live":
+            return await q.message.edit_text(live_text(), reply_markup=live_kb())
         if sub == "metadata":
             return await q.message.edit_text("Global Metadata\n\nSet defaults used automatically by every new job.", reply_markup=global_meta_kb())
         if sub == "new":
@@ -1074,6 +1104,22 @@ async def callbacks(_, q: CallbackQuery):
 
     jid = parts[-1]
     if jid not in jobs: return await q.answer("Unknown job", show_alert=True)
+    if action == "live":
+        sub = parts[1] if len(parts) > 1 else "refresh"
+        if sub == "start":
+            try: await start_live()
+            except Exception as e: return await q.answer(str(e), show_alert=True)
+            await q.answer("Live Cleaner started")
+            return await q.message.edit_text(live_text(), reply_markup=live_kb())
+        if sub == "pause":
+            await pause_live(); await q.answer("Paused"); return await q.message.edit_text(live_text(), reply_markup=live_kb())
+        if sub == "stop":
+            await stop_live(); await q.answer("Stopped"); return await q.message.edit_text(live_text(), reply_markup=live_kb())
+        if sub == "refresh":
+            await q.answer("Updated"); return await q.message.edit_text(live_text(), reply_markup=live_kb())
+        if sub == "back":
+            await q.answer(); return await q.message.edit_text("CLEANFI", reply_markup=main_kb())
+
     if action == "refresh":
         await q.answer("Updated")
         return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
