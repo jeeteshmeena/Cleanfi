@@ -673,6 +673,95 @@ async def process_file_with_retry(jid, mid, message=None):
                 raise
             await asyncio.sleep(min(30, 2 ** attempt))
 
+def live_record():
+    live = settings.setdefault("live", {})
+    live.setdefault("status", "stopped")
+    live.setdefault("meta", jobs.get("__live__", {}).get("meta") or newmeta())
+    live.setdefault("stats", jobs.get("__live__", {}).get("stats", {"files_sent": 0, "bytes_downloaded": 0, "bytes_uploaded": 0}))
+    live.setdefault("queued", 0)
+    live.setdefault("current", None)
+    return live
+
+def live_kb():
+    status = live_record().get("status", "stopped")
+    controls = ([ib("Pause", "live:pause", "delay"), ib("Stop", "live:stop", "cancel", ButtonStyle.DANGER)]
+                if status == "running" else
+                [ib("Resume", "live:start", "start", ButtonStyle.SUCCESS), ib("Stop", "live:stop", "cancel", ButtonStyle.DANGER)]
+                if status == "paused" else
+                [ib("START", "live:start", "start", ButtonStyle.SUCCESS)])
+    return InlineKeyboardMarkup([controls, [ib("Refresh", "live:refresh", "status")], [ib("Back", "live:back", "cancel", ButtonStyle.DANGER)]])
+
+def live_text():
+    live = live_record(); s = live.get("stats", {})
+    return (f"Live Cleaner\n\nStatus: {live.get('status','stopped').title()}\n"
+            f"Source: {settings.get('source') or 'Not set'}\nTarget: {settings.get('target') or 'Not set'}\n"
+            f"Queued: {live.get('queued', 0)}\nCurrent: {live.get('current') or 'Idle'}\n\n"
+            f"Files sent: {s.get('files_sent', 0)}\nData uploaded: {s.get('bytes_uploaded', 0)/(1024**2):.2f} MB")
+
+async def live_worker():
+    global live_queue
+    while True:
+        msg = await live_queue.get()
+        live = live_record()
+        try:
+            while live.get("status") == "paused":
+                await asyncio.sleep(1)
+            if live.get("status") != "running":
+                continue
+            live["current"] = msg.id
+            live["queued"] = max(0, live.get("queued", 0) - 1)
+            # Reuse the same isolated cleaning pipeline, but use the received message directly.
+            result, reason = await process_file_with_retry("__live__", msg.id, message=msg)
+            if result == "ok":
+                live["stats"]["files_sent"] = live["stats"].get("files_sent", 0) + 1
+            await save()
+            if live.get("status") == "running":
+                await asyncio.sleep(get_delay("__live__"))
+        except Exception:
+            log.exception("Live cleaner failed for message %s", msg.id)
+        finally:
+            live["current"] = None
+            await save()
+            live_queue.task_done()
+
+async def start_live():
+    global live_queue, live_task
+    if not settings.get("source") or not settings.get("target"):
+        raise ValueError("Set Source and Target first.")
+    await resolve_chat(settings["source"]); await resolve_chat(settings["target"])
+    live = live_record()
+    live["status"] = "running"
+    jobs["__live__"]["status"] = "running"
+    if live_queue is None: live_queue = asyncio.Queue()
+    if live_task is None or live_task.done(): live_task = asyncio.create_task(live_worker())
+    await save()
+
+async def pause_live():
+    live_record()["status"] = "paused"
+    jobs["__live__"]["status"] = "paused"
+    await save()
+
+async def stop_live():
+    global live_task, live_queue
+    live_record()["status"] = "stopped"; jobs["__live__"]["status"] = "stopped"
+    live_record()["current"] = None
+    if live_task and not live_task.done(): live_task.cancel()
+    live_task = None; live_queue = None
+    await save()
+
+@app.on_message(filters.channel, group=-50)
+async def live_channel_handler(_, m):
+    live = live_record()
+    if live.get("status") != "running" or live_queue is None: return
+    try:
+        if int(m.chat.id) != int(settings.get("source")): return
+    except Exception: return
+    media = m.audio or (m.document if m.document and (getattr(m.document, "mime_type", "") or "").startswith("audio/") else None)
+    if not media: return
+    live["queued"] = live.get("queued", 0) + 1
+    await live_queue.put(m)
+    log.info("LIVE QUEUED source=%s message=%s queue=%s", m.chat.id, m.id, live["queued"])
+
 async def launch(jid, m, ids=None):
     global job_queue, queue_task, queue_order
     if not ids and jobs[jid].get("first_link") and jobs[jid].get("end_link"):
