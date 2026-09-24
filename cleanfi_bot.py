@@ -67,8 +67,8 @@ def load():
     except Exception:
         settings, jobs = {}, {}
     settings.setdefault("source", os.getenv("SOURCE_CHAT_ID", ""))
-    settings.setdefault("authorized_users", sorted(ADMINS))
-    settings["authorized_users"] = sorted({int(x) for x in settings.get("authorized_users", [])} | ADMINS)
+    settings.setdefault("authorized_users", [OWNER_ID])
+    settings["authorized_users"] = sorted({OWNER_ID} | {int(x) for x in settings.get("authorized_users", [])})
     settings.setdefault("live", {"status": "stopped", "meta": {}, "stats": {"files_sent": 0, "bytes_downloaded": 0, "bytes_uploaded": 0}})
     if settings["live"].get("status") in {"running", "paused"}:
         settings["live"]["status"] = "stopped"
@@ -96,7 +96,7 @@ def load():
         j.setdefault("stats", {"files_sent": len(j.get("processed", [])), "bytes_downloaded": 0, "bytes_uploaded": 0, "started_at": j.get("started_at"), "finished_at": None})
 
 def allowed(m):
-    return bool(m.from_user and (m.from_user.id in ADMINS or m.from_user.id in settings.get("authorized_users", [])))
+    return bool(m.from_user and m.from_user.id in settings.get("authorized_users", []))
 
 def is_owner(m):
     return bool(m.from_user and m.from_user.id == OWNER_ID)
@@ -970,7 +970,7 @@ async def run_job(jid, ids=None):
 
 @app.on_callback_query()
 async def callbacks(_, q: CallbackQuery):
-    if not q.from_user or not (q.from_user.id in ADMINS or q.from_user.id in settings.get("authorized_users", [])):
+    if not q.from_user or q.from_user.id not in settings.get("authorized_users", []):
         return await q.answer("Not authorized", show_alert=True)
     parts = q.data.split(":"); action = parts[0]
     log.info("CALLBACK user=%s data=%s", q.from_user.id, q.data)
