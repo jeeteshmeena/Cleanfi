@@ -719,7 +719,7 @@ def live_kb():
                 [ib("Resume", "live:start", "start", ButtonStyle.SUCCESS), ib("Stop", "live:stop", "cancel", ButtonStyle.DANGER)]
                 if status == "paused" else
                 [ib("START", "live:start", "start", ButtonStyle.SUCCESS)])
-    return InlineKeyboardMarkup([controls, [ib("Refresh", "live:refresh", "status")], [ib("Back", "live:back", "cancel", ButtonStyle.DANGER)]])
+    return InlineKeyboardMarkup([controls, [ib("Live Source", "live:source", "source"), ib("Live Target", "live:target", "target")], [ib("Live Metadata", "live:meta", "genre")], [ib("Refresh", "live:refresh", "status")], [ib("Back", "live:back", "cancel", ButtonStyle.DANGER)]])
 
 def live_text():
     live = live_record(); s = live.get("stats", {})
@@ -757,9 +757,12 @@ async def live_worker():
 
 async def start_live():
     global live_queue, live_task
-    if not settings.get("source") or not settings.get("target"):
-        raise ValueError("Set Source and Target first.")
-    await resolve_chat(settings["source"]); await resolve_chat(settings["target"])
+    live = live_record()
+    if not live.get("source") or not live.get("target"):
+        raise ValueError("Set Live Source and Live Target first.")
+    await resolve_chat(live["source"]); await resolve_chat(live["target"])
+    jobs["__live__"]["source"] = live["source"]
+    jobs["__live__"]["target"] = live["target"]
     live = live_record()
     live["status"] = "running"
     jobs["__live__"]["status"] = "running"
@@ -785,12 +788,20 @@ async def live_channel_handler(_, m):
     live = live_record()
     if live.get("status") != "running" or live_queue is None: return
     try:
-        if int(m.chat.id) != int(settings.get("source")): return
+        if int(m.chat.id) != int(live.get("source")): return
     except Exception: return
+    body = " ".join(x for x in [(m.text or ""), (m.caption or "")] if x)
+    if re.search(r"https?://pocketfm\\.com/show(?:/|\\b)", body, re.I):
+        if live.get("pending_link"): return
+        live["status"] = "paused"; jobs["__live__"]["status"] = "paused"
+        live["pending_link"] = {"message_id": int(m.id)}
+        await save()
+        await app.send_message(OWNER_ID, "Pocket FM show link detected in Live Cleaner.\n\nDo you want to change the live metadata before continuing?", reply_markup=InlineKeyboardMarkup([[ib("Yes", "live:link_yes", "start", ButtonStyle.SUCCESS), ib("Skip", "live:link_skip", "cancel")]]))
+        return
     media = m.audio or (m.document if m.document and (getattr(m.document, "mime_type", "") or "").startswith("audio/") else None)
     if not media: return
     live["queued"] = live.get("queued", 0) + 1
-    await live_queue.put(m)
+    await live_queue.put((m, dict(live.get("meta") or newmeta())))
     log.info("LIVE QUEUED source=%s message=%s queue=%s", m.chat.id, m.id, live["queued"])
 
 async def launch(jid, m, ids=None):
