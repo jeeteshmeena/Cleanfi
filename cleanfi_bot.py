@@ -58,6 +58,7 @@ job_tasks = {}
 live_queue = None
 live_task = None
 live_link_timeout_task = None
+live_upload_semaphore = None
 live_seen_ids = set()
 
 
@@ -691,6 +692,17 @@ async def download_media_direct(media, path, jid, client=None, message=None):
         jobs[jid].setdefault("stats", {})["bytes_downloaded"] = jobs[jid].get("stats", {}).get("bytes_downloaded", 0) + written
     return path
 
+async def live_send_audio(target, **kw):
+    global live_upload_semaphore
+    if live_upload_semaphore is None:
+        live_upload_semaphore = asyncio.Semaphore(3)
+    while True:
+        try:
+            async with live_upload_semaphore:
+                return await app.send_audio(int(target), **kw)
+        except FloodWait as e:
+            await asyncio.sleep(max(1, int(e.value)) + 1)
+
 async def process_file(jid, mid, message=None, meta_override=None, source_client=None):
     j = jobs[jid]
     meta = meta_override or j["meta"]
@@ -730,7 +742,10 @@ async def process_file(jid, mid, message=None, meta_override=None, source_client
         if meta.get("artist"): kw["performer"] = str(meta["artist"])
         cp = meta.get("cover_path")
         if cp and Path(cp).is_file(): kw["thumb"] = cp
-        await tg_call(lambda: app.send_audio(int(j["target"]), **kw), jid, "upload")
+        if jid == "__live__":
+            await live_send_audio(j["target"], **kw)
+        else:
+            await tg_call(lambda: app.send_audio(int(j["target"]), **kw), jid, "upload")
         j.setdefault("stats", {})["files_sent"] = j.get("stats", {}).get("files_sent", 0) + 1
         j["stats"]["bytes_uploaded"] = j.get("stats", {}).get("bytes_uploaded", 0) + upload_bytes
         return "ok", None
