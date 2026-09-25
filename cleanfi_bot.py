@@ -861,9 +861,10 @@ async def start_live():
     if start_id <= 0:
         raise ValueError("Set Live Start ID first.")
     if user_app is None:
-        raise ValueError("Live userbot is not configured. Add USERBOT_SESSION_STRING first.")
-    await resolve_chat(live["source"]); await resolve_chat(live["target"])
-    await user_app.get_chat(live["source"])
+        raise ValueError("Connect the Live userbot first with /userbot.")
+    await resolve_chat(live["target"])
+    source_entity = await user_app.get_entity(int(live["source"]) if re.fullmatch(r"-?\d+", str(live["source"])) else live["source"])
+    live["source"] = str(source_entity.id)
     jobs["__live__"]["source"] = live["source"]
     jobs["__live__"]["target"] = live["target"]
     jobs["__live__"]["start_id"] = start_id
