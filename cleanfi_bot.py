@@ -1062,7 +1062,8 @@ async def connect_saved_userbot():
     if USERBOT_SESSION_STRING:
         user_app = TelegramClient(StringSession(USERBOT_SESSION_STRING), USERBOT_API_ID, USERBOT_API_HASH)
     elif USERBOT_SESSION_FILE.exists():
-        user_app = TelegramClient(str(USERBOT_SESSION_FILE), USERBOT_API_ID, USERBOT_API_HASH)
+        saved_session = USERBOT_SESSION_FILE.read_text(encoding="utf-8").strip()
+        user_app = TelegramClient(StringSession(saved_session), USERBOT_API_ID, USERBOT_API_HASH)
     else:
         return False
     await user_app.connect()
