@@ -816,6 +816,7 @@ async def start_live():
     jobs["__live__"]["source"] = live["source"]
     jobs["__live__"]["target"] = live["target"]
     jobs["__live__"]["start_id"] = start_id
+    jobs["__live__"]["start"] = start_id
     live = live_record()
     live["status"] = "running"
     live["pending_link"] = None
@@ -825,21 +826,22 @@ async def start_live():
     if live_task is None or live_task.done():
         live_task = asyncio.create_task(live_worker())
 
-    # First start is deterministic: queue existing audio from Start ID through the
-    # newest available message in chronological order, then keep listening for new posts.
+    # Telegram bots cannot use GetHistory. Start ID is therefore the exact
+    # lower bound for live updates, and the configured start message is fetched once.
     if not live.get("backlog_loaded"):
-        backlog = []
-        async for msg in app.get_chat_history(int(live["source"])):
-            if msg.id < start_id:
-                break
-            media = msg.audio or (msg.document if msg.document and (getattr(msg.document, "mime_type", "") or "").startswith("audio/") else None)
-            if media:
-                body = " ".join(x for x in [(msg.text or ""), (msg.caption or "")] if x)
-                if not re.search(r"https?://pocketfm\\.com/show(?:/|\\b)", body, re.I):
-                    backlog.append(msg)
-        for msg in reversed(backlog):
-            live["queued"] = live.get("queued", 0) + 1
-            await live_queue.put((msg, dict(live.get("meta") or newmeta())))
+        msg = await tg_call(
+            lambda: app.get_messages(int(live["source"]), start_id),
+            "__live__",
+            "live start message"
+        )
+        if not msg or int(msg.id) != start_id:
+            raise ValueError(f"Live Start ID {start_id} could not be found in the Live Source.")
+        media = msg.audio or (msg.document if msg.document and (getattr(msg.document, "mime_type", "") or "").startswith("audio/") else None)
+        if media:
+            body = " ".join(x for x in [(msg.text or ""), (msg.caption or "")] if x)
+            if not re.search(r"https?://pocketfm\.com/show(?:/|\b)", body, re.I):
+                live["queued"] = live.get("queued", 0) + 1
+                await live_queue.put((msg, dict(live.get("meta") or newmeta())))
         live["backlog_loaded"] = True
         await save()
 
@@ -1255,6 +1257,19 @@ async def callbacks(_, q: CallbackQuery):
         if sub == "stop":
             await stop_live(); await q.answer("Stopped"); return await q.message.edit_text(live_text(), reply_markup=live_kb())
 
+    if action == "lcover":
+        sub = parts[1] if len(parts) > 1 else ""
+        if sub == "set":
+            sessions[(q.from_user.id, "live_cover")] = True
+            await q.answer()
+            return await q.message.reply_text("Send the Live Cleaner cover / thumbnail image now. No caption is required.")
+        if sub == "clear":
+            live_record()["meta"]["cover_path"] = None
+            await save()
+            await q.answer("Cover cleared")
+            return await q.message.edit_text("Live Cleaner Metadata", reply_markup=live_meta_kb())
+        return await q.answer("Invalid Live cover action", show_alert=True)
+
     jid = parts[-1]
     if jid not in jobs: return await q.answer("Unknown job", show_alert=True)
     if action == "live":
@@ -1272,19 +1287,6 @@ async def callbacks(_, q: CallbackQuery):
             await q.answer("Updated"); return await q.message.edit_text(live_text(), reply_markup=live_kb())
         if sub == "back":
             await q.answer(); return await q.message.edit_text("CLEANFI", reply_markup=main_kb())
-
-    if action == "lcover":
-        sub = parts[1] if len(parts) > 1 else ""
-        if sub == "set":
-            sessions[(q.from_user.id, "live_cover")] = True
-            await q.answer()
-            return await q.message.reply_text("Send the Live Cleaner cover / thumbnail image now. No caption is required.")
-        if sub == "clear":
-            live_record()["meta"]["cover_path"] = None
-            await save()
-            await q.answer("Cover cleared")
-            return await q.message.edit_text("Live Cleaner Metadata", reply_markup=live_meta_kb())
-        return await q.answer("Invalid Live cover action", show_alert=True)
 
     if action == "lmeta":
         field = parts[1] if len(parts) > 1 else ""
@@ -1436,6 +1438,7 @@ async def field_input(_, m):
                 return await m.reply_text("Live Start ID must be a positive Telegram message ID.")
             live_record()["start_id"] = int(text)
             live_record()["backlog_loaded"] = False
+            live_record()["pending_link"] = None
             jobs["__live__"]["start_id"] = int(text)
             sessions.pop((m.from_user.id, "live_field"), None)
             await save()
