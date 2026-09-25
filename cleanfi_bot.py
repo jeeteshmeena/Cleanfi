@@ -807,7 +807,7 @@ async def live_channel_handler(_, m):
         if int(m.chat.id) != int(live.get("source")): return
     except Exception: return
     body = " ".join(x for x in [(m.text or ""), (m.caption or "")] if x)
-    if re.search(r"https?://pocketfm\\.com/show(?:/|\\b)", body, re.I):
+    if re.search(r"https?://pocketfm\.com/show(?:/|\b)", body, re.I):
         if live.get("pending_link"): return
         live["status"] = "paused"; jobs["__live__"]["status"] = "paused"
         live["pending_link"] = {"message_id": int(m.id)}
