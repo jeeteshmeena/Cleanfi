@@ -2,3 +2,5 @@ pyrotgfork==2.2.24
 TgCrypto>=1.2
 mutagen>=1.47
 python-dotenv>=1.0
+
+telethon>=1.42.0
