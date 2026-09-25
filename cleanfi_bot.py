@@ -9,7 +9,7 @@ from pyrogram.handlers import RawUpdateHandler, MessageHandler
 from pyrogram.file_id import FileId
 from dotenv import load_dotenv
 from mutagen import File as MFile
-from telethon import TelegramClient, events, errors
+from telethon import TelegramClient, events, errors, functions
 from telethon.sessions import StringSession
 from metadata import clean_and_apply_metadata, read_original_title
 
@@ -42,6 +42,7 @@ user_login_task = None
 user_login_phone = None
 user_login_code_hash = None
 user_login_prompt_id = None
+user_login_code_timeout = 0
 jobs, settings, sessions, running = {}, {}, {}, {}
 state_lock = None
 tg_lock = None
@@ -1259,12 +1260,13 @@ async def send_userbot_prompt(text, reply_markup=None):
     return msg
 
 async def cancel_userbot_login():
-    global user_login_client, user_login_task, user_login_phone, user_login_code_hash, user_login_prompt_id
+    global user_login_client, user_login_task, user_login_phone, user_login_code_hash, user_login_prompt_id, user_login_code_timeout
     if user_login_task and not user_login_task.done():
         user_login_task.cancel()
     user_login_task = None
     user_login_phone = None
     user_login_code_hash = None
+    user_login_code_timeout = 0
     for key in ((OWNER_ID, "userbot_field"), (OWNER_ID, "userbot_2fa")):
         sessions.pop(key, None)
     await delete_userbot_prompt()
