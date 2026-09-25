@@ -1159,6 +1159,53 @@ async def callback_handler(_, q: CallbackQuery):
     data = q.data or ""
     p = data.split(":")
     try:
+        if data in {"confirm:job", "confirm:global", "cancel_confirm:job", "cancel_confirm:global"}:
+            kind = data.split(":", 1)[1]
+            key = (q.from_user.id, "pending_job" if kind == "job" else "pending_global")
+            pending = sessions.get(key)
+
+            if data.startswith("cancel_confirm:"):
+                sessions.pop(key, None)
+                await q.answer("Cancelled")
+                return await q.message.reply_text(
+                    "CLEANFI" if kind == "global" else "Job update cancelled.",
+                    reply_markup=main_kb() if kind == "global" else job_kb(pending[0]) if pending and pending[0] in jobs else main_kb()
+                )
+
+            if not pending:
+                return await q.answer("Nothing to confirm.", show_alert=True)
+
+            if kind == "job":
+                jid, field, value = pending
+                if jid not in jobs:
+                    sessions.pop(key, None)
+                    return await q.answer("Unknown job.", show_alert=True)
+                jobs[jid]["meta"][field] = value
+                sessions.pop(key, None)
+                await save()
+                await q.answer("Saved")
+                return await q.message.reply_text(
+                    f"{field.replace('_', ' ').title()} updated for Job {jid}.",
+                    reply_markup=job_kb(jid)
+                )
+
+            field, value = pending
+            if field == "cover_path":
+                settings.setdefault("global_meta", {})["cover_path"] = value
+            elif field == "delay":
+                settings["file_delay"] = min(MAX_DELAY_SECONDS, max(MIN_DELAY_SECONDS, int(value)))
+            elif field in {"source", "target"}:
+                settings[field] = str(value)
+                for job in jobs.values():
+                    if job.get("status") in {"configured", "paused"}:
+                        job[field] = str(value)
+            else:
+                settings.setdefault("global_meta", {})[field] = value
+            sessions.pop(key, None)
+            await save()
+            await q.answer("Saved")
+            return await q.message.reply_text("Global setting updated.", reply_markup=main_kb())
+
         if data == "m:live":
             await q.answer()
             return await q.message.reply_text(live_text(), reply_markup=live_kb())
