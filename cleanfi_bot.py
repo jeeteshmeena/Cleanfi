@@ -5,7 +5,7 @@ from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.enums import ButtonStyle
 from pyrogram.errors import FloodWait
-from pyrogram.handlers import RawUpdateHandler
+from pyrogram.handlers import RawUpdateHandler, MessageHandler
 from pyrogram.file_id import FileId
 from dotenv import load_dotenv
 from mutagen import File as MFile
@@ -15,6 +15,9 @@ load_dotenv()
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+USERBOT_API_ID = int(os.getenv("USERBOT_API_ID", str(API_ID)))
+USERBOT_API_HASH = os.getenv("USERBOT_API_HASH", API_HASH)
+USERBOT_SESSION_STRING = os.getenv("USERBOT_SESSION_STRING", "").strip()
 ADMIN_IDS_LIST = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 ADMINS = set(ADMIN_IDS_LIST)
 OWNER_ID = int(os.getenv("OWNER_ID", str(ADMIN_IDS_LIST[0] if ADMIN_IDS_LIST else 0)))
@@ -30,6 +33,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 log = logging.getLogger("cleanfi")
 
 app = Client("cleanfi", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+user_app = Client("cleanfi_user", api_id=USERBOT_API_ID, api_hash=USERBOT_API_HASH, session_string=USERBOT_SESSION_STRING) if USERBOT_SESSION_STRING else None
 jobs, settings, sessions, running = {}, {}, {}, {}
 state_lock = None
 tg_lock = None
@@ -44,6 +48,7 @@ queue_order = []
 job_tasks = {}
 live_queue = None
 live_task = None
+live_seen_ids = set()
 
 
 def save_sync():
@@ -655,12 +660,13 @@ async def test_cmd(_, m):
     jid = await create_job(m.from_user.id, int(p[1]), int(p[1]))
     await m.reply_text(summary(jid), reply_markup=job_kb(jid))
 
-async def download_media_direct(media, path, jid):
+async def download_media_direct(media, path, jid, client=None):
     """Download through Pyrogram's media generator so FloodWait is not swallowed by Message.download()."""
+    client = client or app
     file_id = FileId.decode(media.file_id)
     written = 0
     with open(path, "wb") as fp:
-        async for chunk in app.get_file(file_id, file_size=getattr(media, "file_size", 0) or 0):
+        async for chunk in client.get_file(file_id, file_size=getattr(media, "file_size", 0) or 0):
             fp.write(chunk)
             written += len(chunk)
     if written <= 0:
@@ -669,12 +675,13 @@ async def download_media_direct(media, path, jid):
         jobs[jid].setdefault("stats", {})["bytes_downloaded"] = jobs[jid].get("stats", {}).get("bytes_downloaded", 0) + written
     return path
 
-async def process_file(jid, mid, message=None, meta_override=None):
+async def process_file(jid, mid, message=None, meta_override=None, source_client=None):
     j = jobs[jid]
     meta = meta_override or j["meta"]
     if MIN_FREE_DISK_GB and __import__("shutil").disk_usage(TEMP).free < MIN_FREE_DISK_GB * 1024**3:
         return "failed", f"Low disk space: less than {MIN_FREE_DISK_GB} GB free"
-    msg = message or await tg_call(lambda: app.get_messages(int(j["source"]), mid), jid, "get_messages")
+    source_client = source_client or app
+    msg = message or await tg_call(lambda: source_client.get_messages(int(j["source"]), mid), jid, "get_messages")
     media = msg.audio or (msg.document if msg.document and (getattr(msg.document, "mime_type", "") or "").startswith("audio/") else None)
     if not media: return "skip", "message has no audio media"
     name = infer_name(media)
@@ -685,7 +692,7 @@ async def process_file(jid, mid, message=None, meta_override=None):
     d = TEMP / jid; d.mkdir(exist_ok=True)
     inp = d / f"{mid}_{Path(name).name}"; out = d / f"out_{mid}_{Path(name).name}"
     try:
-        await download_media_direct(media, str(inp), jid)
+        await download_media_direct(media, str(inp), jid, client=source_client)
         title = read_original_title(str(inp))
         if title is None:
             try:
@@ -710,11 +717,11 @@ async def process_file(jid, mid, message=None, meta_override=None):
             try: p.unlink()
             except FileNotFoundError: pass
 
-async def process_file_with_retry(jid, mid, message=None, meta_override=None):
+async def process_file_with_retry(jid, mid, message=None, meta_override=None, source_client=None):
     attempt = 0
     while True:
         try:
-            return await process_file(jid, mid, message=message, meta_override=meta_override)
+            return await process_file(jid, mid, message=message, meta_override=meta_override, source_client=source_client)
         except FloodWait:
             raise
         except Exception:
@@ -735,6 +742,9 @@ def live_record():
     live.setdefault("stats", jobs.get("__live__", {}).get("stats", {"files_sent": 0, "bytes_downloaded": 0, "bytes_uploaded": 0}))
     live.setdefault("queued", 0)
     live.setdefault("current", None)
+    live.setdefault("backlog_loaded", False)
+    live.setdefault("loading_backlog", False)
+    live.setdefault("ingest_buffer", [])
     return live
 
 def live_meta_kb():
@@ -777,7 +787,9 @@ async def live_worker():
     queue = live_queue
     while True:
         item = await queue.get()
-        msg, queued_meta = item if isinstance(item, tuple) else (item, None)
+        kind = item[0] if isinstance(item, tuple) else "audio"
+        msg = item[1] if isinstance(item, tuple) else item
+        source_client = item[2] if isinstance(item, tuple) and len(item) > 2 else app
         live = live_record()
         try:
             while live.get("status") == "paused":
@@ -786,7 +798,25 @@ async def live_worker():
                 continue
             live["current"] = msg.id
             live["queued"] = max(0, live.get("queued", 0) - 1)
-            result, reason = await process_file_with_retry("__live__", msg.id, message=msg, meta_override=queued_meta)
+            if kind == "link":
+                live["status"] = "paused"
+                jobs["__live__"]["status"] = "paused"
+                live["pending_link"] = {"message_id": int(msg.id)}
+                await save()
+                await app.send_message(
+                    OWNER_ID,
+                    "Pocket FM show link reached in Live Cleaner.\n\nDo you want to change the Live metadata before the next files?",
+                    reply_markup=InlineKeyboardMarkup([
+                        [ib("Yes", "live:link_yes", "start", ButtonStyle.SUCCESS),
+                         ib("Skip", "live:link_skip", "cancel")]
+                    ])
+                )
+                continue
+            queued_meta = dict(live.get("meta") or newmeta())
+            result, reason = await process_file_with_retry(
+                "__live__", msg.id, message=msg,
+                meta_override=queued_meta, source_client=source_client
+            )
             if result == "ok":
                 live["stats"]["files_sent"] = live["stats"].get("files_sent", 0) + 1
             await save()
@@ -795,7 +825,7 @@ async def live_worker():
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.exception("Live cleaner failed for message %s", msg.id)
+            log.exception("Live cleaner failed for message %s", getattr(msg, "id", "?"))
         finally:
             live["current"] = None
             try:
@@ -805,45 +835,61 @@ async def live_worker():
             await save()
 
 async def start_live():
-    global live_queue, live_task
+    global live_queue, live_task, live_seen_ids
     live = live_record()
     if not live.get("source") or not live.get("target"):
         raise ValueError("Set Live Source and Live Target first.")
     start_id = int(live.get("start_id") or 0)
     if start_id <= 0:
         raise ValueError("Set Live Start ID first.")
+    if user_app is None:
+        raise ValueError("Live userbot is not configured. Add USERBOT_SESSION_STRING first.")
     await resolve_chat(live["source"]); await resolve_chat(live["target"])
+    await user_app.get_chat(live["source"])
     jobs["__live__"]["source"] = live["source"]
     jobs["__live__"]["target"] = live["target"]
     jobs["__live__"]["start_id"] = start_id
     jobs["__live__"]["start"] = start_id
-    live = live_record()
-    live["status"] = "running"
+    live["status"] = "starting"
     live["pending_link"] = None
-    jobs["__live__"]["status"] = "running"
+    live["loading_backlog"] = True
+    live["ingest_buffer"] = []
+    live["backlog_loaded"] = False
+    jobs["__live__"]["status"] = "starting"
     if live_queue is None:
         live_queue = asyncio.Queue()
     if live_task is None or live_task.done():
         live_task = asyncio.create_task(live_worker())
 
-    # Telegram bots cannot use GetHistory. Start ID is therefore the exact
-    # lower bound for live updates, and the configured start message is fetched once.
-    if not live.get("backlog_loaded"):
-        msg = await tg_call(
-            lambda: app.get_messages(int(live["source"]), start_id),
-            "__live__",
-            "live start message"
-        )
-        if not msg or int(msg.id) != start_id:
-            raise ValueError(f"Live Start ID {start_id} could not be found in the Live Source.")
+    history = []
+    async for msg in user_app.get_chat_history(int(live["source"])):
+        if int(msg.id) < start_id:
+            break
+        history.append(msg)
+    buffered = list(live.get("ingest_buffer") or [])
+    live["ingest_buffer"] = []
+    merged = {int(m.id): m for m in history}
+    for m in buffered:
+        if int(m.id) >= start_id:
+            merged[int(m.id)] = m
+    live_seen_ids = set(merged)
+    ordered = [merged[mid] for mid in sorted(merged)]
+    for msg in ordered:
+        body = " ".join(x for x in [(msg.text or ""), (msg.caption or "")] if x)
+        is_link = bool(re.search(r"https?://pocketfm\.com/show(?:/|\b)", body, re.I))
         media = msg.audio or (msg.document if msg.document and (getattr(msg.document, "mime_type", "") or "").startswith("audio/") else None)
-        if media:
-            body = " ".join(x for x in [(msg.text or ""), (msg.caption or "")] if x)
-            if not re.search(r"https?://pocketfm\.com/show(?:/|\b)", body, re.I):
-                live["queued"] = live.get("queued", 0) + 1
-                await live_queue.put((msg, dict(live.get("meta") or newmeta())))
-        live["backlog_loaded"] = True
-        await save()
+        if is_link:
+            live["queued"] = live.get("queued", 0) + 1
+            await live_queue.put(("link", msg, user_app))
+        elif media:
+            live["queued"] = live.get("queued", 0) + 1
+            await live_queue.put(("audio", msg, user_app))
+    live["loading_backlog"] = False
+    live["backlog_loaded"] = True
+    live["status"] = "running"
+    jobs["__live__"]["status"] = "running"
+    await save()
+    log.info("LIVE BACKLOG LOADED source=%s start_id=%s messages=%s", live["source"], start_id, len(ordered))
 
 async def pause_live():
     live_record()["status"] = "paused"
@@ -858,562 +904,48 @@ async def stop_live():
     live_task = None; live_queue = None
     await save()
 
+async def ingest_live_message(m, source_client):
+    global live_seen_ids
+    live = live_record()
+    if live.get("status") not in {"starting", "running", "paused"} or live_queue is None:
+        return
+    try:
+        if int(m.chat.id) != int(live.get("source")) or int(m.id) < int(live.get("start_id") or 0):
+            return
+    except Exception:
+        return
+    mid = int(m.id)
+    if mid in live_seen_ids:
+        return
+    live_seen_ids.add(mid)
+    body = " ".join(x for x in [(m.text or ""), (m.caption or "")] if x)
+    is_link = bool(re.search(r"https?://pocketfm\.com/show(?:/|\b)", body, re.I))
+    media = m.audio or (m.document if m.document and (getattr(m.document, "mime_type", "") or "").startswith("audio/") else None)
+    if live.get("loading_backlog"):
+        live.setdefault("ingest_buffer", []).append(m)
+        return
+    if is_link:
+        live["queued"] = live.get("queued", 0) + 1
+        await live_queue.put(("link", m, source_client))
+        log.info("LIVE LINK QUEUED source=%s message=%s queue=%s", m.chat.id, m.id, live["queued"])
+        return
+    if not media:
+        return
+    live["queued"] = live.get("queued", 0) + 1
+    await live_queue.put(("audio", m, source_client))
+    log.info("LIVE AUDIO QUEUED source=%s message=%s queue=%s", m.chat.id, m.id, live["queued"])
+
 @app.on_message(filters.channel, group=-50)
 async def live_channel_handler(_, m):
-    live = live_record()
-    if live.get("status") != "running" or live_queue is None: return
-    try:
-        if int(m.chat.id) != int(live.get("source")): return
-        if int(m.id) < int(live.get("start_id") or 0): return
-    except Exception: return
-    body = " ".join(x for x in [(m.text or ""), (m.caption or "")] if x)
-    if re.search(r"https?://pocketfm\.com/show(?:/|\b)", body, re.I):
-        if live.get("pending_link"): return
-        live["status"] = "paused"; jobs["__live__"]["status"] = "paused"
-        live["pending_link"] = {"message_id": int(m.id)}
-        await save()
-        await app.send_message(OWNER_ID, "Pocket FM show link detected in Live Cleaner.\n\nDo you want to change the live metadata before continuing?", reply_markup=InlineKeyboardMarkup([[ib("Yes", "live:link_yes", "start", ButtonStyle.SUCCESS), ib("Skip", "live:link_skip", "cancel")]]))
+    if user_app is not None:
         return
-    media = m.audio or (m.document if m.document and (getattr(m.document, "mime_type", "") or "").startswith("audio/") else None)
-    if not media: return
-    live["queued"] = live.get("queued", 0) + 1
-    await live_queue.put((m, dict(live.get("meta") or newmeta())))
-    log.info("LIVE QUEUED source=%s message=%s queue=%s", m.chat.id, m.id, live["queued"])
+    await ingest_live_message(m, app)
 
-async def launch(jid, m, ids=None):
-    global job_queue, queue_task, queue_order
-    if not ids and jobs[jid].get("first_link") and jobs[jid].get("end_link"):
-        ids = await fetch_batch_ids(jid)
-    if jid in running or jid in queued_jobs:
-        return await m.reply_text(f"Job {jid} is already running or queued.")
-    if len(queued_jobs) >= MAX_QUEUE:
-        return await m.reply_text(f"Queue is full ({MAX_QUEUE} jobs). Start it after a slot is available.")
-    if jobs[jid].get("status") in {"completed", "completed_with_failures", "cancelled"} and not ids:
-        # A completed job can be started again; processed/skipped IDs remain protected from duplicates.
-        pass
-    if job_queue is None:
-        job_queue = asyncio.Queue()
-    jobs[jid]["queue_ids"] = list(ids) if ids else None
-    jobs[jid]["status"] = "queued"
-    jobs[jid]["cancel_requested"] = False
-    queued_jobs.add(jid)
-    queue_order.append(jid)
-    await job_queue.put(jid)
-    if queue_task is None or queue_task.done():
-        queue_task = asyncio.create_task(queue_worker())
-    await save()
-    # Never derive a queue position from a set: set iteration order is not FIFO.
-    # queue_order is the authoritative waiting order.
-    position = queue_order.index(jid) + 1
-    await m.reply_text(f"Job {jid} queued. Queue position: {position}\nOnly one job runs at a time; the next job starts automatically after this job ends.")
-
-async def queue_worker():
-    while True:
-        jid = await job_queue.get()
-        queued_jobs.discard(jid)
-        if jid in queue_order:
-            queue_order.remove(jid)
-        if jid not in jobs:
-            job_queue.task_done(); continue
-        if jobs[jid].get("cancel_requested"):
-            jobs[jid]["status"] = "cancelled"
-            await save(); job_queue.task_done(); continue
-        try:
-            running[jid] = True
-            task = asyncio.create_task(run_job(jid, jobs[jid]["queue_ids"]))
-            job_tasks[jid] = task
-            try:
-                await task
-            finally:
-                job_tasks.pop(jid, None)
-        except Exception as e:
-            j = jobs.get(jid)
-            if j:
-                j["status"] = "failed_queue"
-                j["failed_reasons"]["__job__"] = f"{type(e).__name__}: {e}"
-                await save()
-                try: await app.send_message(j["owner"], f"Job {jid} stopped unexpectedly: {type(e).__name__}: {e}")
-                except Exception: pass
-        finally:
-            running.pop(jid, None)
-            if jid in jobs and jobs[jid].get("status") == "running":
-                jobs[jid]["status"] = "completed_with_failures" if jobs[jid]["failed"] else "completed"
-            await save()
-            job_queue.task_done()
-
-async def run_job(jid, ids=None):
-    j = jobs[jid]
-    j["status"] = "running"
-    j["started_at"] = j.get("started_at") or time.time()
-    j["flood_until"] = 0
-    j["flood_label"] = None
-    j.setdefault("stats", {})["started_at"] = j["started_at"]
-    j["stats"]["finished_at"] = None
-    await save()
-    ids = ids if ids is not None else list(range(j["start"], j["end"] + 1))
-    completed = set(j["processed"]) | set(j["skipped"])
-    ids = [i for i in ids if i not in completed]
-    await safe_progress(jid, True)
-    try:
-        if j.get("start_post", {}).get("image_path") and not j.get("start_post", {}).get("sent"):
-            try:
-                await post_start(jid)
-            except Exception as e:
-                log.exception("Start post failed for job %s", jid)
-                try:
-                    await app.send_message(j["owner"], f"Start post failed for job {jid}: {type(e).__name__}: {e}\nThe file task will continue.")
-                except Exception:
-                    pass
-
-        for mid in ids:
-            if j.get("cancel_requested"):
-                break
-            j["current"] = mid
-            await safe_progress(jid, True)
-
-            result = None
-            reason = None
-            try:
-                while True:
-                    try:
-                        result, reason = await process_file_with_retry(jid, mid)
-                        break
-                    except FloodWait as e:
-                        seconds = max(1, int(e.value))
-                        j["status"] = "paused"
-                        j["flood_until"] = time.time() + seconds
-                        j["flood_label"] = "Telegram FloodWait"
-                        await save()
-                        await safe_progress(jid, True)
-                        log.warning("FloodWait on job %s for %ss; pausing and retrying message %s", jid, seconds, mid)
-                        try:
-                            await app.send_message(
-                                j["owner"],
-                                f"Job {jid} paused due to Telegram FloodWait.\nWaiting {seconds}s, then the same file will retry automatically."
-                            )
-                        except Exception:
-                            pass
-                        await asyncio.sleep(seconds + 1)
-                        j["flood_until"] = 0
-                        j["flood_label"] = None
-                        j["status"] = "running"
-                        await save()
-                        await safe_progress(jid, True)
-
-                if result == "ok":
-                    if mid not in j["processed"]:
-                        j["processed"].append(mid)
-                elif result == "skip":
-                    if mid not in j["skipped"]:
-                        j["skipped"].append(mid)
-                else:
-                    if mid not in j["failed"]:
-                        j["failed"].append(mid)
-                    j["failed_reasons"][str(mid)] = reason or "unknown"
-
-            except Exception as e:
-                if mid not in j["failed"]:
-                    j["failed"].append(mid)
-                j["failed_reasons"][str(mid)] = f"{type(e).__name__}: {e}"
-                log.exception("File processing failed: job=%s message=%s", jid, mid)
-
-            finally:
-                j["current"] = None
-                await save()
-                await safe_progress(jid, True)
-                if not j.get("cancel_requested"):
-                    # Throttle only between files; Telegram FloodWait remains authoritative.
-                    # With the default 3s delay, normal throughput is allowed to reach ~5-6/min
-                    # depending on download/metadata/upload time without intentionally adding 12s waits.
-                    await asyncio.sleep(get_delay(jid))
-
-        if j.get("cancel_requested"):
-            j["status"] = "cancelled"
-        elif j["failed"]:
-            j["status"] = "completed_with_failures"
-        else:
-            j["status"] = "completed"
-
-    except asyncio.CancelledError:
-        j["cancel_requested"] = True
-        j["status"] = "cancelled"
-        log.info("JOB CANCELLED IMMEDIATELY job=%s", jid)
-    finally:
-        j["current"] = None
-        j.setdefault("stats", {})["finished_at"] = time.time()
-        await save()
-        await safe_progress(jid, True)
-        if j.get("status") in {"completed", "completed_with_failures"}:
-            try:
-                await post_end(jid)
-            except Exception:
-                log.exception("End post failed for job %s", jid)
-            s = j["stats"]
-            elapsed = max(0, s.get("finished_at", time.time()) - (s.get("started_at") or time.time()))
-            try:
-                await app.send_message(j["owner"], f"Job {jid} completed.\n\nFiles sent: {s.get('files_sent', 0)}\nData uploaded: {s.get('bytes_uploaded', 0)/(1024**2):.2f} MB\nFailed: {len(j['failed'])}\nSkipped: {len(j['skipped'])}\nTotal time: {int(elapsed//60)}m {int(elapsed%60)}s")
-            except Exception:
-                pass
-        elif j.get("status") == "cancelled":
-            try:
-                await app.send_message(j["owner"], f"Job {jid} was cancelled.\n\nFiles sent: {j['stats'].get('files_sent', 0)}\nData uploaded: {j['stats'].get('bytes_uploaded', 0)/(1024**2):.2f} MB")
-            except Exception:
-                pass
-
-@app.on_callback_query()
-async def callbacks(_, q: CallbackQuery):
-    if not q.from_user or q.from_user.id not in settings.get("authorized_users", []):
-        return await q.answer("Not authorized", show_alert=True)
-    parts = q.data.split(":"); action = parts[0]
-    log.info("CALLBACK user=%s data=%s", q.from_user.id, q.data)
-
-    if action == "m":
-        sub = parts[1]
-        await q.answer()
-        if sub == "users":
-            if q.from_user.id != OWNER_ID: return await q.answer("Owner only", show_alert=True)
-            return await q.message.reply_text("Authorized Users\n\n" + "\n".join(str(x) for x in authorized_users()), reply_markup=main_kb())
-        if sub == "live":
-            return await q.message.edit_text(live_text(), reply_markup=live_kb())
-        if sub == "metadata":
-            return await q.message.edit_text("Global Metadata\n\nSet defaults used automatically by every new job.", reply_markup=global_meta_kb())
-        if sub == "new":
-            jid = await create_batch_job(q.from_user.id, "", "")
-            sessions[(q.from_user.id, "batch_first")] = jid
-            return await q.message.reply_text("Batch Mode\n\nSend me the first audio post link (e.g., https://t.me/channel/123).")
-        if sub == "jobs":
-            rows = [f"{x} - {j['status']} - {len(j['processed'])}/{j['total']}" for x,j in list(jobs.items())[-20:]]
-            return await q.message.reply_text("JOBS\n\n" + ("\n".join(rows) or "No jobs."), reply_markup=main_kb())
-        if sub == "stats":
-            total_sent = sum(j.get("stats", {}).get("files_sent", len(j.get("processed", []))) for j in jobs.values())
-            total_mb = sum(j.get("stats", {}).get("bytes_uploaded", 0) for j in jobs.values()) / (1024**2)
-            total_failed = sum(len(j.get("failed", [])) for j in jobs.values())
-            total_skipped = sum(len(j.get("skipped", [])) for j in jobs.values())
-            return await q.message.reply_text(f"Stats\n\nFiles sent: {total_sent}\nData uploaded: {total_mb:.2f} MB\nFailed files: {total_failed}\nSkipped files: {total_skipped}\nJobs: {len(jobs)}", reply_markup=main_kb())
-        if sub in {"source","target","delay"}:
-            sessions[q.from_user.id] = None
-            sessions[(q.from_user.id, "global_field")] = sub
-            prompts = {
-                "artist":"Send global artist name.",
-                "album":"Send global album name.",
-                "album_artist":"Send global album artist.",
-                "genre":"Send global genre, or choose one below.",
-                "year":"Send global year.",
-                "comment":"Send global comment.",
-                "source":"Send source channel username or ID.",
-                "target":"Send target channel username or ID.",
-                "delay":"Send delay in seconds (3-60)."
-            }
-            if sub == "genre":
-                rows = [[ib(x, f"gg:{i}", "genre", ButtonStyle.PRIMARY)] for i,x in enumerate(GENRE_OPTIONS)]
-                rows.append([ib("Custom", "gg:custom", "genre", ButtonStyle.PRIMARY)])
-                return await q.message.reply_text(prompts[sub], reply_markup=InlineKeyboardMarkup(rows))
-            return await q.message.reply_text(prompts[sub])
-        if sub == "cover":
-            sessions[(q.from_user.id, "global_cover")] = True
-            return await q.message.reply_text("Send the global cover image now.")
-        if sub == "status":
-            sessions[(q.from_user.id, "global_field")] = "status"
-            return await q.message.reply_text("Send the Job ID.")
-        if sub == "failed":
-            sessions[(q.from_user.id, "global_field")] = "failed"
-            return await q.message.reply_text("Send the Job ID.")
-        if sub == "help":
-            return await q.message.reply_text("Use /batch to create a Batch job. Set Source and Target from the menu. Set Artist and Cover are global defaults. Delay controls the seconds between files.")
-
-    if action == "gm":
-        sub = parts[1]
-        if sub == "back":
-            await q.answer()
-            return await q.message.edit_text("Welcome to Cleanfi", reply_markup=main_kb())
-        if sub == "cover":
-            sessions[(q.from_user.id, "global_cover")] = True
-            await q.answer()
-            return await q.message.reply_text("Send the global cover image now.")
-        if sub in {"artist","album","album_artist","genre","year","comment"}:
-            sessions[(q.from_user.id, "global_field")] = sub
-            if sub == "genre":
-                rows = [[ib(x, f"gg:{i}", "genre", ButtonStyle.PRIMARY)] for i,x in enumerate(GENRE_OPTIONS)]
-                rows.append([ib("Custom", "gg:custom", "genre", ButtonStyle.PRIMARY)])
-                await q.answer()
-                return await q.message.reply_text("Choose global genre:", reply_markup=InlineKeyboardMarkup(rows))
-            await q.answer()
-            return await q.message.reply_text(f"Send global {sub.replace('_',' ')}.")
-        return await q.answer("Unknown setting", show_alert=True)
-
-    if action == "gg":
-        value = parts[1]
-        if value == "custom":
-            sessions[q.from_user.id] = None
-            sessions[(q.from_user.id, "global_field")] = "genre"
-            await q.answer()
-            return await q.message.reply_text("Send custom global genre.")
-        sessions[(q.from_user.id, "pending_global")] = ("genre", GENRE_OPTIONS[int(value)])
-        sessions.pop((q.from_user.id, "global_field"), None)
-        await q.answer()
-        return await q.message.reply_text(
-            f"Set global genre to: {GENRE_OPTIONS[int(value)]}\n\nConfirm?",
-            reply_markup=confirm_kb("global")
-        )
-    if action == "confirm":
-        kind = parts[1] if len(parts) > 1 else ""
-        if kind == "global":
-            pending = sessions.pop((q.from_user.id, "pending_global"), None)
-            if not pending:
-                return await q.answer("Nothing pending", show_alert=True)
-            field, value = pending[0], pending[1]
-            if field in {"source","target"}:
-                settings[field] = value
-            elif field == "delay":
-                settings["file_delay"] = int(value)
-            else:
-                settings.setdefault("global_meta", {})[field] = value
-            await save()
-            log.info("GLOBAL SET user=%s field=%s value=%s", q.from_user.id, field, value)
-            await q.answer("Saved")
-            if field == "cover_path":
-                label = "Cover"
-                return await q.message.edit_text("Global Cover saved successfully.", reply_markup=global_meta_kb())
-            label = field.replace("_", " ").title()
-            return await q.message.edit_text(f"Global {label} saved successfully.\n\nValue: {value}", reply_markup=global_meta_kb() if field in {"artist","album","album_artist","genre","year","comment","cover_path"} else main_kb())
-        if kind == "job":
-            pending = sessions.pop((q.from_user.id, "pending_job"), None)
-            if not pending:
-                return await q.answer("Nothing pending", show_alert=True)
-            jid, field, value = pending
-            if jid not in jobs:
-                return await q.answer("Job no longer exists", show_alert=True)
-            jobs[jid]["meta"][field] = value
-            await save()
-            log.info("JOB SET user=%s job=%s field=%s value=%s", q.from_user.id, jid, field, value)
-            await q.answer("Saved")
-            return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
-        await q.answer("Confirmed")
-        return await q.message.reply_text(f"{kind.title()} confirmed.", reply_markup=main_kb())
-    if action == "cancel_confirm":
-        sessions.pop((q.from_user.id, "pending_global"), None)
-        sessions.pop((q.from_user.id, "pending_job"), None)
-        sessions.pop((q.from_user.id, "global_field"), None)
-        sessions.pop((q.from_user.id, "field"), None)
-        await q.answer("Cancelled")
-        return await q.message.reply_text("Cancelled. No changes were saved.", reply_markup=main_kb())
-
-    if action == "live":
-        sub = parts[1] if len(parts) > 1 else "refresh"
-        if sub == "source" or sub == "target":
-            sessions[(q.from_user.id, "live_field")] = sub
-            await q.answer()
-            return await q.message.reply_text(f"Send Live {sub.title()} channel username or ID.")
-        if sub == "startid":
-            sessions[(q.from_user.id, "live_field")] = "start_id"
-            await q.answer()
-            return await q.message.reply_text("Send the Telegram message ID from which Live Cleaner should start.")
-        if sub == "meta":
-            await q.answer()
-            return await q.message.edit_text("Live Cleaner Metadata", reply_markup=live_meta_kb())
-        if sub == "meta_back" or sub == "back":
-            await q.answer()
-            return await q.message.edit_text(live_text(), reply_markup=live_kb())
-        if sub == "continue":
-            pending = live_record().get("pending_link")
-            if not pending: return await q.answer("No pending link", show_alert=True)
-            try:
-                msg = await tg_call(lambda: app.get_messages(int(live_record()["source"]), int(pending["message_id"])), "__live__", "live pending")
-                live_record()["pending_link"] = None
-                live_record()["status"] = "running"; jobs["__live__"]["status"] = "running"
-                live_record()["queued"] = live_record().get("queued", 0) + 1
-                await live_queue.put((msg, dict(live_record().get("meta") or newmeta())))
-                await save(); await q.answer("Live Cleaner resumed")
-                return await q.message.edit_text(live_text(), reply_markup=live_kb())
-            except Exception as e:
-                return await q.answer(f"Could not resume: {type(e).__name__}", show_alert=True)
-        if sub == "link_yes":
-            if not live_record().get("pending_link"): return await q.answer("No pending link", show_alert=True)
-            await q.answer()
-            return await q.message.edit_text("Update Live Metadata, then press Continue.", reply_markup=live_meta_kb())
-        if sub == "link_skip":
-            pending = live_record().get("pending_link")
-            if not pending: return await q.answer("No pending link", show_alert=True)
-            try:
-                msg = await tg_call(lambda: app.get_messages(int(live_record()["source"]), int(pending["message_id"])), "__live__", "live pending")
-                live_record()["pending_link"] = None
-                live_record()["status"] = "running"; jobs["__live__"]["status"] = "running"
-                live_record()["queued"] = live_record().get("queued", 0) + 1
-                await live_queue.put((msg, dict(live_record().get("meta") or newmeta())))
-                await save(); await q.answer("Skipped")
-                return await q.message.edit_text(live_text(), reply_markup=live_kb())
-            except Exception as e:
-                return await q.answer(f"Could not resume: {type(e).__name__}", show_alert=True)
-        if sub == "refresh":
-            await q.answer("Updated")
-            return await q.message.edit_text(live_text(), reply_markup=live_kb())
-        if sub == "start":
-            try: await start_live()
-            except Exception as e: return await q.answer(str(e), show_alert=True)
-            await q.answer("Live Cleaner started")
-            return await q.message.edit_text(live_text(), reply_markup=live_kb())
-        if sub == "pause":
-            await pause_live(); await q.answer("Paused"); return await q.message.edit_text(live_text(), reply_markup=live_kb())
-        if sub == "stop":
-            await stop_live(); await q.answer("Stopped"); return await q.message.edit_text(live_text(), reply_markup=live_kb())
-
-    if action == "lcover":
-        sub = parts[1] if len(parts) > 1 else ""
-        if sub == "set":
-            sessions[(q.from_user.id, "live_cover")] = True
-            await q.answer()
-            return await q.message.reply_text("Send the Live Cleaner cover / thumbnail image now. No caption is required.")
-        if sub == "clear":
-            live_record()["meta"]["cover_path"] = None
-            await save()
-            await q.answer("Cover cleared")
-            return await q.message.edit_text("Live Cleaner Metadata", reply_markup=live_meta_kb())
-        return await q.answer("Invalid Live cover action", show_alert=True)
-
-    jid = parts[-1]
-    if jid not in jobs: return await q.answer("Unknown job", show_alert=True)
-    if action == "live":
-        sub = parts[1] if len(parts) > 1 else "refresh"
-        if sub == "start":
-            try: await start_live()
-            except Exception as e: return await q.answer(str(e), show_alert=True)
-            await q.answer("Live Cleaner started")
-            return await q.message.edit_text(live_text(), reply_markup=live_kb())
-        if sub == "pause":
-            await pause_live(); await q.answer("Paused"); return await q.message.edit_text(live_text(), reply_markup=live_kb())
-        if sub == "stop":
-            await stop_live(); await q.answer("Stopped"); return await q.message.edit_text(live_text(), reply_markup=live_kb())
-        if sub == "refresh":
-            await q.answer("Updated"); return await q.message.edit_text(live_text(), reply_markup=live_kb())
-        if sub == "back":
-            await q.answer(); return await q.message.edit_text("CLEANFI", reply_markup=main_kb())
-
-    if action == "lmeta":
-        field = parts[1] if len(parts) > 1 else ""
-        if field in {"artist","genre","year","album","album_artist","comment"}:
-            sessions[(q.from_user.id, "live_field")] = field
-            await q.answer()
-            return await q.message.reply_text(f"Send Live {field.replace('_',' ')}.")
-        return await q.answer("Invalid Live metadata field", show_alert=True)
-
-    if action == "refresh":
-        await q.answer("Updated")
-        return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
-    if action == "start":
-        await q.answer()
-        return await q.message.reply_text(
-            f"Confirm start of Job {jid}?\n\n{summary(jid)}",
-            reply_markup=InlineKeyboardMarkup([
-                [ib("Confirm", f"confirm_start:{jid}", "start", ButtonStyle.SUCCESS),
-                 ib("Cancel", f"cancel_start:{jid}", "cancel", ButtonStyle.DANGER)]
-            ])
-        )
-    if action == "confirm_start":
-        await q.answer("Starting")
-        return await launch(jid, q.message)
-    if action == "cancel_start":
-        await q.answer("Cancelled")
-        return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
-    if action == "cancel":
-        j = jobs[jid]
-        if j.get("status") in {"completed", "completed_with_failures", "cancelled", "failed_queue"}:
-            await q.answer("Job is already stopped.", show_alert=True)
-            return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
-        j["cancel_requested"] = True
-        if j.get("status") == "queued":
-            queued_jobs.discard(jid)
-            if jid in queue_order: queue_order.remove(jid)
-            j["status"] = "cancelled"
-            j["current"] = None
-        else:
-            j["status"] = "cancelling"
-        await save()
-        log.info("CANCEL requested user=%s job=%s status=%s", q.from_user.id, jid, j["status"])
-        await q.answer("Cancellation requested")
-        return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
-    if action == "startpost":
-        j = jobs[jid]
-        if j.get("status") in {"running", "queued"}:
-            return await q.answer("Set the start post before starting the job.", show_alert=True)
-        sessions[q.from_user.id] = jid
-        sessions[(q.from_user.id, "startpost")] = True
-        await q.answer()
-        return await q.message.reply_text(
-            f"Send the start image for Job {jid} with the story name as its caption.\n"
-            "When the job starts, Cleanfi will send this image to the target channel and pin it automatically."
-        )
-    if action == "clear": jobs[jid]["meta"]["cover_path"] = None; await save(); return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
-    if action == "cover":
-        sessions[q.from_user.id] = jid
-        sessions[(q.from_user.id, "job_cover")] = True
-        await q.answer()
-        return await q.message.reply_text(f"Send the cover image for Job {jid} now. No command or caption is required.")
-    if action == "genre":
-        await q.answer()
-        rows = [[InlineKeyboardButton(x, callback_data=f"g:{jid}:{i}")] for i,x in enumerate(GENRE_OPTIONS)]
-        rows.append([InlineKeyboardButton("Custom", callback_data=f"gc:{jid}")])
-        return await q.message.reply_text("Choose genre:", reply_markup=InlineKeyboardMarkup(rows))
-    if action == "g":
-        idx = int(parts[2])
-        jobs[jid]["meta"]["genre"] = GENRE_OPTIONS[idx]
-        await save()
-        await q.answer(f"Genre: {GENRE_OPTIONS[idx]}")
-        return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
-    if action == "gc":
-        sessions[q.from_user.id] = jid
-        sessions[(q.from_user.id, "field")] = "genre"
-        await q.answer()
-        return await q.message.reply_text("Send custom genre.")
-    if action == "s":
-        field = parts[1]
-        if field not in {"artist","genre","year","album","album_artist","comment"}:
-            return await q.answer("Invalid metadata field", show_alert=True)
-        sessions[q.from_user.id] = jid
-        sessions[(q.from_user.id, "field")] = field
-        await q.answer()
-        return await q.message.reply_text(f"Send {field.replace('_',' ')} value for Job {jid}.")
-
-async def handle_batch_link_input(m, text):
-    uid = m.from_user.id
-    jid = sessions.get((uid, "batch_first"))
-    if not jid or jid not in jobs:
-        return False
-    if not re.match(r"^https?://t\.me/(?:c/\d+/|[A-Za-z0-9_]+)/\d+(?:\?.*)?$", text):
-        await m.reply_text("Please send a valid Telegram message link, for example:\nhttps://t.me/channel/123")
-        return True
-    j = jobs[jid]
-    if not j.get("first_link"):
-        j["first_link"] = text
-        sessions[(uid, "batch_end")] = jid
-        sessions.pop((uid, "batch_first"), None)
-        await save()
-        await m.reply_text(f"First link saved for Job {jid}.\n\nNow send the last audio post link. No command or caption is required.")
-        return True
-    return False
-
-async def finalize_batch_job(m, jid, end_link):
-    j = jobs[jid]
-    j["end_link"] = end_link
-    sessions.pop((m.from_user.id, "batch_end"), None)
-    sessions.pop((m.from_user.id, "batch_first"), None)
-    try:
-        await m.reply_text(f"Reading the two Telegram posts for Job {jid}...")
-        ids = await fetch_batch_ids(jid)
-        if not ids:
-            raise ValueError("No message range found")
-        await save()
-        await m.reply_text(
-            f"Job {jid} configured successfully.\nFiles: {len(ids)}\n"
-            f"Source: {j['source']}\nTarget: {j['target']}\n\n"
-            "Global metadata has been copied to this job. Job-specific metadata can be changed before starting.",
-            reply_markup=job_kb(jid)
-        )
-    except Exception as e:
-        log.exception("BATCH LINK FINALIZE FAILED job=%s", jid)
-        j["status"] = "failed_queue"
-        j["failed_reasons"]["__setup__"] = f"{type(e).__name__}: {e}"
-        await save()
-        await m.reply_text(f"Could not read the Telegram message range for Job {jid}.\nError: {type(e).__name__}: {e}\n\nCheck Source and make sure both links belong to it.", reply_markup=main_kb())
+if user_app is not None:
+    user_app.add_handler(
+        MessageHandler(lambda client, message: ingest_live_message(message, user_app), filters.channel),
+        group=-50
+    )
 
 @app.on_message(filters.private, group=-90)
 async def field_input(_, m):
@@ -1508,8 +1040,25 @@ async def field_input(_, m):
 
 def main():
     load()
-    log.info("Starting Cleanfi Telegram client...")
-    app.run()
+    if user_app is None:
+        log.warning("USERBOT_SESSION_STRING is not configured. Live Cleaner historical mode is disabled.")
+    else:
+        log.info("Live userbot is configured.")
+    log.info("Starting Cleanfi Telegram clients...")
+    async def runner():
+        await app.start()
+        if user_app is not None:
+            await user_app.start()
+            me = await user_app.get_me()
+            log.info("Live userbot logged in as %s (%s)", me.first_name or "", me.id)
+        try:
+            await asyncio.Event().wait()
+        finally:
+            if user_app is not None and user_app.is_connected:
+                await user_app.stop()
+            if app.is_connected:
+                await app.stop()
+    app.run(runner())
 
 if __name__ == "__main__":
     main()
