@@ -986,7 +986,7 @@ async def callback_handler(_, q: CallbackQuery):
             if user_app is not None and await user_app.is_user_authorized():
                 me = await user_app.get_me()
                 return await q.message.reply_text(
-                    f"Userbot connected.\\nAccount: {getattr(me, 'first_name', '')}\\nUser ID: {me.id}",
+                    f"Userbot connected.\nAccount: {getattr(me, 'first_name', '')}\nUser ID: {me.id}",
                     reply_markup=InlineKeyboardMarkup([
                         [ib("Refresh", "userbot:status", "status")],
                         [ib("Disconnect", "userbot:logout", "cancel", ButtonStyle.DANGER)],
@@ -994,7 +994,7 @@ async def callback_handler(_, q: CallbackQuery):
                     ])
                 )
             return await q.message.reply_text(
-                "Live Userbot\\n\\nConnect your Telegram account to let Live Cleaner read channel history and live messages.",
+                "Live Userbot\n\nConnect your Telegram account to let Live Cleaner read channel history and live messages.",
                 reply_markup=InlineKeyboardMarkup([
                     [ib("Login with Phone", "userbot:login", "source", ButtonStyle.SUCCESS)],
                     [ib("Cancel", "userbot:cancel", "cancel", ButtonStyle.DANGER)]
@@ -1015,7 +1015,7 @@ async def callback_handler(_, q: CallbackQuery):
             if user_app is not None and await user_app.is_user_authorized():
                 me = await user_app.get_me()
                 return await q.message.reply_text(
-                    f"Userbot connected.\\nAccount: {getattr(me, 'first_name', '')}\\nUser ID: {me.id}",
+                    f"Userbot connected.\nAccount: {getattr(me, 'first_name', '')}\nUser ID: {me.id}",
                     reply_markup=InlineKeyboardMarkup([
                         [ib("Refresh", "userbot:status", "status")],
                         [ib("Disconnect", "userbot:logout", "cancel", ButtonStyle.DANGER)]
@@ -1052,13 +1052,13 @@ async def callback_handler(_, q: CallbackQuery):
         if data == "m:jobs":
             await q.answer()
             rows = [f"{x} — {j['status']} — {len(j['processed'])}/{j['total']}" for x,j in list(jobs.items())[-20:]]
-            return await q.message.reply_text("JOBS\\n\\n" + ("\\n".join(rows) or "No jobs."), reply_markup=main_kb())
+            return await q.message.reply_text("JOBS\n\n" + ("\n".join(rows) or "No jobs."), reply_markup=main_kb())
 
         if data == "m:stats":
             await q.answer()
             return await q.message.reply_text(
-                f"Stats\\n\\nNormal jobs: {sum(1 for x in jobs if x != '__live__')}\\n"
-                f"Live files sent: {live_record().get('stats', {}).get('files_sent', 0)}\\n"
+                f"Stats\n\nNormal jobs: {sum(1 for x in jobs if x != '__live__')}\n"
+                f"Live files sent: {live_record().get('stats', {}).get('files_sent', 0)}\n"
                 f"Live uploaded: {live_record().get('stats', {}).get('bytes_uploaded', 0)/(1024**2):.2f} MB",
                 reply_markup=main_kb()
             )
@@ -1066,7 +1066,7 @@ async def callback_handler(_, q: CallbackQuery):
         if data == "m:status":
             await q.answer()
             rows = [f"{x} — {j['status']} — {len(j['processed'])}/{j['total']}" for x,j in list(jobs.items())[-10:]]
-            return await q.message.reply_text("STATUS\\n\\n" + ("\\n".join(rows) or "No jobs."), reply_markup=main_kb())
+            return await q.message.reply_text("STATUS\n\n" + ("\n".join(rows) or "No jobs."), reply_markup=main_kb())
 
         if data == "m:failed":
             await q.answer()
@@ -1074,21 +1074,21 @@ async def callback_handler(_, q: CallbackQuery):
             for x,j in jobs.items():
                 if j.get("failed"):
                     rows.append(f"{x} — {len(j['failed'])} failed")
-            return await q.message.reply_text("FAILED\\n\\n" + ("\\n".join(rows) or "No failed files."), reply_markup=main_kb())
+            return await q.message.reply_text("FAILED\n\n" + ("\n".join(rows) or "No failed files."), reply_markup=main_kb())
 
         if data == "m:users":
             await q.answer()
             return await q.message.reply_text(
-                "Authorized Users\\n\\n" + "\\n".join(str(x) for x in authorized_users()),
+                "Authorized Users\n\n" + "\n".join(str(x) for x in authorized_users()),
                 reply_markup=main_kb()
             )
 
         if data == "m:help":
             await q.answer()
             return await q.message.reply_text(
-                "CLEANFI\\n\\n/range START END\\n/source @channel\\n/target @channel\\n"
-                "/meta artist=... genre=... year=...\\n/cover JOBID\\n/startjob JOBID\\n"
-                "/status JOBID\\n/delay SECONDS\\n/cancel JOBID\\n/retry JOBID\\n/failed JOBID",
+                "CLEANFI\n\n/range START END\n/source @channel\n/target @channel\n"
+                "/meta artist=... genre=... year=...\n/cover JOBID\n/startjob JOBID\n"
+                "/status JOBID\n/delay SECONDS\n/cancel JOBID\n/retry JOBID\n/failed JOBID",
                 reply_markup=main_kb()
             )
 
@@ -1122,7 +1122,7 @@ async def callback_handler(_, q: CallbackQuery):
                 return await q.message.reply_text(live_text(), reply_markup=live_kb())
             except Exception as e:
                 log.exception("LIVE START FROM INLINE BUTTON FAILED")
-                return await q.message.reply_text(f"Live Cleaner could not start.\\n{type(e).__name__}: {e}", reply_markup=live_kb())
+                return await q.message.reply_text(f"Live Cleaner could not start.\n{type(e).__name__}: {e}", reply_markup=live_kb())
 
         if data == "live:pause":
             await pause_live()
@@ -1285,7 +1285,7 @@ async def begin_phone_userbot_login(user_id, message):
     if user_app is not None and await user_app.is_user_authorized():
         me = await user_app.get_me()
         return await send_userbot_prompt(
-            f"Userbot is already connected.\\nAccount: {getattr(me, 'first_name', '')}\\nUser ID: {me.id}",
+            f"Userbot is already connected.\nAccount: {getattr(me, 'first_name', '')}\nUser ID: {me.id}",
             InlineKeyboardMarkup([[ib("Disconnect", "userbot:logout", "cancel", ButtonStyle.DANGER)]])
         )
     user_login_client = TelegramClient(StringSession(), USERBOT_API_ID, USERBOT_API_HASH)
@@ -1294,8 +1294,8 @@ async def begin_phone_userbot_login(user_id, message):
     user_login_code_hash = None
     sessions[(user_id, "userbot_field")] = "phone"
     return await send_userbot_prompt(
-        "Userbot Login\\n\\nSend your Telegram phone number in international format.\\n"
-        "Example: +919876543210\\n\\nThis is used only for this login session and is never saved.",
+        "Userbot Login\n\nSend your Telegram phone number in international format.\n"
+        "Example: +919876543210\n\nThis is used only for this login session and is never saved.",
         InlineKeyboardMarkup([[ib("Cancel", "userbot:cancel", "cancel", ButtonStyle.DANGER)]])
     )
 
@@ -1319,7 +1319,7 @@ async def complete_userbot_login():
     me = await user_app.get_me()
     await app.send_message(
         OWNER_ID,
-        f"Userbot login successful.\\nAccount: {getattr(me, 'first_name', '')}\\nUser ID: {me.id}\\n\\n"
+        f"Userbot login successful.\nAccount: {getattr(me, 'first_name', '')}\nUser ID: {me.id}\n\n"
         "Live Cleaner can now read channel history and live messages.",
         reply_markup=live_kb()
     )
@@ -1372,22 +1372,25 @@ async def field_input(_, m):
                 # +919876543210, +91 98765 43210, +91-98765-43210.
                 # Normalize separators before handing the number to Telethon.
                 phone = value.strip()
-                if not re.fullmatch(r"\\+?[0-9][0-9 ()-]{6,20}", phone):
+                # Telegram numbers are commonly pasted with spaces, hyphens,
+                # parentheses, or without the leading +. Keep only the digits
+                # and an optional leading + so valid numbers are not rejected
+                # by the UI validator.
+                if phone.startswith("+"):
+                    user_login_phone = "+" + re.sub(r"\\D", "", phone)
+                else:
+                    user_login_phone = re.sub(r"\\D", "", phone)
+                digits = user_login_phone[1:] if user_login_phone.startswith("+") else user_login_phone
+                if not (7 <= len(digits) <= 15):
                     return await send_userbot_prompt(
-                        "Invalid phone number format. Send it again in international format.\\nExample: +919876543210",
-                        InlineKeyboardMarkup([[ib("Cancel", "userbot:cancel", "cancel", ButtonStyle.DANGER)]])
-                    )
-                user_login_phone = re.sub(r"[ ()-]", "", phone)
-                if not re.fullmatch(r"\\+[0-9]{7,15}", user_login_phone):
-                    return await send_userbot_prompt(
-                        "Please include the country code with +.\\nExample: +919876543210",
+                        "Invalid phone number. Send your Telegram number with country code.\nExample: +919876543210",
                         InlineKeyboardMarkup([[ib("Cancel", "userbot:cancel", "cancel", ButtonStyle.DANGER)]])
                     )
                 sent = await user_login_client.send_code_request(user_login_phone)
                 user_login_code_hash = sent.phone_code_hash
                 sessions[(m.from_user.id, "userbot_field")] = "code"
                 return await send_userbot_prompt(
-                    "Telegram login code sent. Send the code here.\\n\\n"
+                    "Telegram login code sent. Send the code here.\n\n"
                     "Your code message will be deleted immediately after receipt and is not stored.",
                     InlineKeyboardMarkup([[ib("Cancel", "userbot:cancel", "cancel", ButtonStyle.DANGER)]])
                 )
@@ -1406,7 +1409,7 @@ async def field_input(_, m):
                 except errors.SessionPasswordNeededError:
                     sessions[(m.from_user.id, "userbot_field")] = "password"
                     return await send_userbot_prompt(
-                        "Telegram 2-Step Verification is enabled.\\nSend your 2FA password.\\n\\n"
+                        "Telegram 2-Step Verification is enabled.\nSend your 2FA password.\n\n"
                         "It will be deleted immediately and never stored.",
                         InlineKeyboardMarkup([[ib("Cancel", "userbot:cancel", "cancel", ButtonStyle.DANGER)]])
                     )
@@ -1529,7 +1532,7 @@ async def userbot_cmd(_, m):
     if user_app is not None and await user_app.is_user_authorized():
         me = await user_app.get_me()
         return await m.reply_text(
-            f"Userbot connected.\\nAccount: {getattr(me, 'first_name', '')}\\nUser ID: {me.id}",
+            f"Userbot connected.\nAccount: {getattr(me, 'first_name', '')}\nUser ID: {me.id}",
             reply_markup=InlineKeyboardMarkup([
                 [ib("Disconnect", "userbot:logout", "cancel", ButtonStyle.DANGER)],
                 [ib("Back", "m:live", "cancel")]
