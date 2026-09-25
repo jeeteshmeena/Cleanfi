@@ -35,7 +35,7 @@ MIN_FREE_DISK_GB = max(0, int(os.getenv("MIN_FREE_DISK_GB", "2")))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("cleanfi")
 
-app = Client("cleanfi", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("cleanfi", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, max_concurrent_transmissions=3)
 user_app = None
 user_login_client = None
 user_login_task = None
@@ -57,6 +57,7 @@ queue_order = []
 job_tasks = {}
 live_queue = None
 live_task = None
+live_link_timeout_task = None
 live_seen_ids = set()
 
 
@@ -704,7 +705,7 @@ async def process_file(jid, mid, message=None, meta_override=None, source_client
     else:
         media = msg.audio or (msg.document if msg.document and (getattr(msg.document, "mime_type", "") or "").startswith("audio/") else None)
         name = infer_name(media) if media else f"{mid}.mp3"
-        caption = msg.caption or ""
+        caption = getattr(msg, "caption", "") or ""
     if not media: return "skip", "message has no audio media"
     ext = Path(name).suffix.lower()
     supported = {".mp3",".m4a",".mp4",".flac",".ogg",".opus",".wav",".aiff",".aif",".wma",".aac"}
@@ -768,6 +769,42 @@ def live_record():
     live.setdefault("ingest_buffer", [])
     return live
 
+async def send_live_link():
+    global live_link_timeout_task
+    live = live_record()
+    pending = live.get("pending_link") or {}
+    mid = pending.get("message_id")
+    if not mid:
+        return False
+    msg = await user_app.get_messages(int(live["source"]), int(mid))
+    body = (getattr(msg, "text", "") or getattr(msg, "message", "") or "").strip()
+    if not body:
+        body = "Pocket FM show link"
+    global_cover = (settings.get("global_meta") or {}).get("cover_path")
+    live_cover = (live.get("meta") or {}).get("cover_path")
+    cover = global_cover if global_cover and Path(global_cover).is_file() else live_cover
+    if cover and Path(cover).is_file():
+        await tg_call(lambda: app.send_photo(int(live["target"]), photo=str(cover), caption=body), label="live link")
+    else:
+        await tg_call(lambda: app.send_message(int(live["target"]), body), label="live link")
+    live["pending_link"] = None
+    live["status"] = "running"
+    jobs["__live__"]["status"] = "running"
+    await save()
+    if live_link_timeout_task and not live_link_timeout_task.done():
+        live_link_timeout_task.cancel()
+    live_link_timeout_task = None
+    return True
+
+async def live_link_timeout():
+    await asyncio.sleep(30 * 60)
+    live = live_record()
+    if not live.get("pending_link"):
+        return
+    live["meta"] = newmeta()
+    await save()
+    await send_live_link()
+
 def live_meta_kb():
     m = live_record().get("meta") or {}
     cover = "Attached" if m.get("cover_path") else "Not set"
@@ -822,16 +859,25 @@ async def live_worker():
             if kind == "link":
                 live["status"] = "paused"
                 jobs["__live__"]["status"] = "paused"
-                live["pending_link"] = {"message_id": int(msg.id)}
+                live["pending_link"] = {"message_id": int(msg.id), "received_at": time.time()}
                 await save()
                 await app.send_message(
                     OWNER_ID,
-                    "Pocket FM show link reached in Live Cleaner.\n\nDo you want to change the Live metadata before the next files?",
+                    "Pocket FM show link reached.\n\n"
+                    "Yes = change Live metadata first.\n"
+                    "Skip = continue with current Live metadata.\n"
+                    "If there is no response for 30 minutes, Cleanfi will automatically "
+                    "use the DEFAULT GLOBAL metadata and continue.\n\n"
+                    "The Pocket FM link will be sent to the target with the saved cover image.",
                     reply_markup=InlineKeyboardMarkup([
                         [ib("Yes", "live:link_yes", "start", ButtonStyle.SUCCESS),
                          ib("Skip", "live:link_skip", "cancel")]
                     ])
                 )
+                global live_link_timeout_task
+                if live_link_timeout_task and not live_link_timeout_task.done():
+                    live_link_timeout_task.cancel()
+                live_link_timeout_task = asyncio.create_task(live_link_timeout())
                 continue
             queued_meta = dict(live.get("meta") or newmeta())
             result, reason = await process_file_with_retry(
@@ -841,8 +887,6 @@ async def live_worker():
             if result == "ok":
                 live["stats"]["files_sent"] = live["stats"].get("files_sent", 0) + 1
             await save()
-            if live.get("status") == "running":
-                await asyncio.sleep(get_delay("__live__"))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -923,6 +967,7 @@ async def stop_live():
     live_record()["status"] = "stopped"; jobs["__live__"]["status"] = "stopped"
     live_record()["current"] = None
     if live_task and not live_task.done(): live_task.cancel()
+    if live_link_timeout_task and not live_link_timeout_task.done(): live_link_timeout_task.cancel()
     live_task = None; live_queue = None
     await save()
 
@@ -1163,11 +1208,8 @@ async def callback_handler(_, q: CallbackQuery):
             return await q.message.reply_text(live_text(), reply_markup=live_kb())
 
         if data in {"live:continue", "live:link_skip"}:
-            live_record()["pending_link"] = None
-            live_record()["status"] = "running"
-            jobs["__live__"]["status"] = "running"
-            await save()
-            await q.answer("Continued")
+            await q.answer("Sending link...")
+            await send_live_link()
             return await q.message.reply_text(live_text(), reply_markup=live_kb())
 
         if data == "live:link_yes":
