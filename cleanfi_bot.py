@@ -390,9 +390,19 @@ async def create_batch_job(owner, first_link, end_link):
     await save()
     return jid
 
+def parse_telegram_message_link(text):
+    text = (text or "").strip()
+    m = re.match(r"^https?://t\\.me/c/(\\d+)/(\\d+)(?:\\?.*)?$", text)
+    if m:
+        return {"chat": int("-100" + m.group(1)), "message_id": int(m.group(2))}
+    m = re.match(r"^https?://t\\.me/([A-Za-z0-9_]+)/(\\d+)(?:\\?.*)?$", text)
+    if m:
+        return {"chat": m.group(1), "message_id": int(m.group(2))}
+    return None
+
 async def handle_batch_link_input(m, text):
     uid = m.from_user.id
-    if not re.match(r"^https?://t\.me/(?:c/\d+/|[A-Za-z0-9_]+)/\d+(?:\?.*)?$", text):
+    if not parse_telegram_message_link(text):
         await m.reply_text("Please send a valid Telegram message link.")
         return True
     sessions.pop((uid, "batch_first"), None)
@@ -419,8 +429,12 @@ async def finalize_batch_job(m, first_link, end_link):
 
 async def fetch_batch_ids(jid):
     j = jobs[jid]
-    first = await tg_call(lambda: app.get_messages(int(j["source"]), int(j["first_link"].rstrip("/").split("/")[-1])), jid, "batch first link")
-    end = await tg_call(lambda: app.get_messages(int(j["source"]), int(j["end_link"].rstrip("/").split("/")[-1])), jid, "batch end link")
+    first_ref = parse_telegram_message_link(j["first_link"])
+    end_ref = parse_telegram_message_link(j["end_link"])
+    if not first_ref or not end_ref:
+        raise ValueError("Invalid Telegram message link.")
+    first = await tg_call(lambda: app.get_messages(first_ref["chat"], first_ref["message_id"]), jid, "batch first link")
+    end = await tg_call(lambda: app.get_messages(end_ref["chat"], end_ref["message_id"]), jid, "batch end link")
     first_id, end_id = first.id, end.id
     if first_id > end_id: first_id, end_id = end_id, first_id
     j["start"], j["end"] = first_id, end_id
