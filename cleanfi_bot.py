@@ -1422,11 +1422,26 @@ async def field_input(_, m):
                     )
                 sent = await user_login_client.send_code_request(user_login_phone)
                 user_login_code_hash = sent.phone_code_hash
+                user_login_code_timeout = int(getattr(sent, "timeout", 0) or 0)
+                sessions[(m.from_user.id, "userbot_code_sent_at")] = time.time()
                 sessions[(m.from_user.id, "userbot_field")] = "code"
+                sent_type = getattr(sent, "type", None)
+                type_name = type(sent_type).__name__ if sent_type is not None else ""
+                if type_name == "SentCodeTypeApp":
+                    destination = "Check the Telegram service chat (777000) on your other logged-in Telegram session."
+                elif type_name == "SentCodeTypeSms":
+                    destination = "Telegram selected SMS delivery."
+                elif type_name == "SentCodeTypeEmailCode":
+                    destination = "Check your configured Telegram login email."
+                else:
+                    destination = f"Telegram selected {type_name or 'another'} delivery method."
                 return await send_userbot_prompt(
-                    "Telegram login code sent. Send the code here.\n\n"
-                    "Your code message will be deleted immediately after receipt and is not stored.",
-                    InlineKeyboardMarkup([[ib("Cancel", "userbot:cancel", "cancel", ButtonStyle.DANGER)]])
+                    f"Telegram login code requested.\n\n{destination}\n\nSend the code here. "
+                    "Your message will be deleted immediately and is not stored.",
+                    InlineKeyboardMarkup([
+                        [ib("Resend Code", "userbot:resend", "source", ButtonStyle.PRIMARY)],
+                        [ib("Cancel", "userbot:cancel", "cancel", ButtonStyle.DANGER)]
+                    ])
                 )
             if userbot_field == "code":
                 if not re.fullmatch(r"[0-9]{4,8}", value):
