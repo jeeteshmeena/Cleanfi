@@ -9,7 +9,7 @@ from pyrogram.handlers import RawUpdateHandler, MessageHandler
 from pyrogram.file_id import FileId
 from dotenv import load_dotenv
 from mutagen import File as MFile
-from telethon import TelegramClient
+from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from metadata import clean_and_apply_metadata, read_original_title
 
@@ -20,6 +20,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 USERBOT_API_ID = int(os.getenv("USERBOT_API_ID", str(API_ID)))
 USERBOT_API_HASH = os.getenv("USERBOT_API_HASH", API_HASH)
 USERBOT_SESSION_STRING = os.getenv("USERBOT_SESSION_STRING", "").strip()
+USERBOT_SESSION_FILE = Path(os.getenv("USERBOT_SESSION_FILE", "./userbot.session"))
 ADMIN_IDS_LIST = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 ADMINS = set(ADMIN_IDS_LIST)
 OWNER_ID = int(os.getenv("OWNER_ID", str(ADMIN_IDS_LIST[0] if ADMIN_IDS_LIST else 0)))
