@@ -526,13 +526,13 @@ async def cover_media(_, m):
             await tg_call(lambda: m.download(file_name=str(path)), jid, "start post download")
             jobs[jid]["start_post"] = {
                 "image_path": str(path),
-                "caption": m.caption or "",
+                "caption": getattr(m, "caption", "") or "",
                 "sent": False,
             }
             sessions.pop((m.from_user.id, "startpost"), None)
             sessions[m.from_user.id] = jid
             await save()
-            log.info("START POST SAVED user=%s job=%s path=%s caption=%r", m.from_user.id, jid, path, m.caption or "")
+            log.info("START POST SAVED user=%s job=%s path=%s caption=%r", m.from_user.id, jid, path, getattr(m, "caption", "") or "")
             return await m.reply_text(
                 f"Start Post saved successfully for Job {jid}.\n"
                 "The image and caption will be sent to the target channel when the job starts and the post will be pinned.",
@@ -897,7 +897,7 @@ async def start_live():
     live_seen_ids = set(merged)
     ordered = [merged[mid] for mid in sorted(merged)]
     for msg in ordered:
-        body = " ".join(x for x in [(msg.text or ""), (msg.caption or "")] if x)
+        body = " ".join(x for x in [(msg.text or ""), (getattr(msg, "caption", "") or "")] if x)
         is_link = bool(re.search(r"https?://pocketfm\.com/show(?:/|\b)", body, re.I))
         media = msg.audio or (msg.document if msg.document and (getattr(msg.document, "mime_type", "") or "").startswith("audio/") else None)
         if is_link:
