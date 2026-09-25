@@ -55,6 +55,7 @@ queued_jobs = set()
 # counted as a waiting position, but remains the active job ahead of the queue.)
 queue_order = []
 job_tasks = {}
+normal_active_jid = None
 live_queue = None
 live_task = None
 live_link_timeout_task = None
@@ -324,17 +325,42 @@ def job_kb(jid):
     ])
 
 async def launch(jid, m, ids=None):
+    global normal_active_jid
+
     if jid not in jobs:
         raise ValueError("Unknown Job ID.")
     j = jobs[jid]
+
     if j.get("status") == "running":
         return await m.reply_text("Job is already running.", reply_markup=job_kb(jid))
+
+    # Normal jobs are strictly FIFO: only one normal job may process at a time.
+    # A second START never sends its Start Post or files until the current job
+    # has finished/cancelled and the queue reaches it.
+    if normal_active_jid and normal_active_jid != jid and jobs.get(normal_active_jid, {}).get("status") in {"running", "cancelling"}:
+        if jid not in queued_jobs:
+            if len(queue_order) >= MAX_QUEUE:
+                return await m.reply_text("Job queue is full. Please wait for a slot.", reply_markup=job_kb(jid))
+            queued_jobs.add(jid)
+            queue_order.append(jid)
+        j["status"] = "queued"
+        j["cancel_requested"] = False
+        await save()
+        position = queue_order.index(jid) + 1 if jid in queue_order else len(queue_order)
+        return await m.reply_text(
+            f"Job {jid} added to the queue.\nPosition: {position}\nIt will start automatically after the current job finishes.",
+            reply_markup=job_kb(jid)
+        )
 
     if ids is None:
         ids = j.get("queue_ids")
         if not ids:
             ids = await fetch_batch_ids(jid)
 
+    queued_jobs.discard(jid)
+    if jid in queue_order:
+        queue_order.remove(jid)
+    normal_active_jid = jid
     j["status"] = "running"
     j["cancel_requested"] = False
     j["started_at"] = j.get("started_at") or time.time()
@@ -387,8 +413,18 @@ async def launch(jid, m, ids=None):
         except Exception:
             log.exception("END POST FAILED job=%s", jid)
     j["current"] = None
+    if normal_active_jid == jid:
+        normal_active_jid = None
     await save()
     await safe_progress(jid, force=True)
+
+    # Start exactly one queued normal job after this one is finished.
+    if not normal_active_jid and queue_order:
+        next_jid = queue_order.pop(0)
+        queued_jobs.discard(next_jid)
+        if next_jid in jobs and jobs[next_jid].get("status") == "queued":
+            log.info("QUEUE START next_job=%s after_job=%s", next_jid, jid)
+            asyncio.create_task(launch(next_jid, m, jobs[next_jid].get("queue_ids")))
     return await m.reply_text(summary(jid), reply_markup=job_kb(jid))
 
 def summary(jid):
