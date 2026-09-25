@@ -282,12 +282,35 @@ def confirm_kb(kind):
          ib("Cancel", f"cancel_confirm:{kind}", "cancel", ButtonStyle.DANGER)]
     ])
 
+GENRE_OPTIONS = [
+    "Romantasy",
+    "Romance",
+    "Fantasy",
+    "Drama",
+    "Suspense & Thriller",
+    "System and Superpowers",
+    "Mystery",
+    "Action",
+    "Historical",
+    "Paranormal",
+]
+
+def genre_kb(jid):
+    rows = []
+    for i in range(0, len(GENRE_OPTIONS), 2):
+        row = []
+        for idx in range(i, min(i + 2, len(GENRE_OPTIONS))):
+            row.append(ib(GENRE_OPTIONS[idx], f"genreopt:{idx}:{jid}", "genre", ButtonStyle.PRIMARY))
+        rows.append(row)
+    rows.append([ib("Custom", f"genrecustom:{jid}", "genre", ButtonStyle.SUCCESS)])
+    rows.append([ib("Back", f"genrecancel:{jid}", "cancel", ButtonStyle.DANGER)])
+    return InlineKeyboardMarkup(rows)
+
 def job_kb(jid):
     m = jobs[jid]["meta"]
     return InlineKeyboardMarkup([
         [ib(f"Artist: {m.get('artist') or 'Not set'}", f"s:artist:{jid}", "artist", ButtonStyle.PRIMARY)],
-        [ib(f"Genre: {m.get('genre') or 'Not set'}", f"s:genre:{jid}", "genre", ButtonStyle.PRIMARY),
-         ib("Choose", f"genre:{jid}", "genre", ButtonStyle.PRIMARY)],
+        [ib(f"Genre: {m.get('genre') or 'Not set'}", f"genre:{jid}", "genre", ButtonStyle.PRIMARY)],
         [ib(f"Year: {m.get('year') or 'Not set'}", f"s:year:{jid}", "status", ButtonStyle.PRIMARY)],
         [ib(f"Album: {m.get('album') or 'Not set'}", f"s:album:{jid}", "genre", ButtonStyle.PRIMARY)],
         [ib(f"Album Artist: {m.get('album_artist') or 'Not set'}", f"s:album_artist:{jid}", "artist", ButtonStyle.PRIMARY)],
@@ -1464,7 +1487,7 @@ async def callback_handler(_, q: CallbackQuery):
             await q.answer()
             return await q.message.reply_text(f"Send global {field.replace('_', ' ')}.")
 
-        if data.startswith("s:") or data.startswith("genre:") or data.startswith("cover:") or data.startswith("clear:") or data.startswith("startpost:") or data.startswith("start:") or data.startswith("cancel:") or data.startswith("refresh:"):
+        if data.startswith("s:") or data.startswith("genre:") or data.startswith("genreopt:") or data.startswith("genrecustom:") or data.startswith("genrecancel:") or data.startswith("cover:") or data.startswith("clear:") or data.startswith("startpost:") or data.startswith("start:") or data.startswith("cancel:") or data.startswith("refresh:"):
             jid = p[-1]
             if jid not in jobs:
                 return await q.answer("Unknown job", show_alert=True)
@@ -1499,10 +1522,36 @@ async def callback_handler(_, q: CallbackQuery):
                 await q.answer()
                 return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
             if data.startswith("genre:"):
+                await q.answer()
+                return await q.message.reply_text(
+                    f"Choose Genre for Job {jid}:",
+                    reply_markup=genre_kb(jid)
+                )
+            if data.startswith("genreopt:"):
+                try:
+                    idx = int(p[1])
+                    genre = GENRE_OPTIONS[idx]
+                except (ValueError, IndexError):
+                    return await q.answer("Invalid genre.", show_alert=True)
+                jobs[jid]["meta"]["genre"] = genre
+                sessions.pop((q.from_user.id, "field"), None)
+                await save()
+                await q.answer("Genre saved")
+                return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
+            if data.startswith("genrecustom:"):
                 sessions[q.from_user.id] = jid
                 sessions[(q.from_user.id, "field")] = "genre"
                 await q.answer()
-                return await q.message.reply_text("Send genre or use /meta.")
+                return await q.message.reply_text(
+                    f"Send custom genre for Job {jid}.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [ib("Cancel", f"genrecancel:{jid}", "cancel", ButtonStyle.DANGER)]
+                    ])
+                )
+            if data.startswith("genrecancel:"):
+                sessions.pop((q.from_user.id, "field"), None)
+                await q.answer("Cancelled")
+                return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
             if data.startswith("startpost:"):
                 sessions[q.from_user.id] = jid
                 sessions[(q.from_user.id, "startpost")] = True
