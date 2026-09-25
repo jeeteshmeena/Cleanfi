@@ -266,7 +266,7 @@ def main_kb():
          ib("Set Target", "m:target", "target", ButtonStyle.PRIMARY)],
         [ib("Delay", "m:delay", "delay", ButtonStyle.PRIMARY),
          ib("New Job", "m:new", "new", ButtonStyle.SUCCESS)],
-        [ib("Live Cleaner", "m:live", "start", ButtonStyle.SUCCESS), ib("Connect Userbot", "m:userbot", "source", ButtonStyle.PRIMARY)],
+        [ib("Live Cleaner", "m:live", "start", ButtonStyle.SUCCESS), ib("Login", "m:userbot", "source", ButtonStyle.PRIMARY)],
         [ib("Users", "m:users", "status", ButtonStyle.PRIMARY), ib("Jobs", "m:jobs", "jobs", ButtonStyle.PRIMARY)],
         [ib("Stats", "m:stats", "status", ButtonStyle.PRIMARY), ib("Status", "m:status", "status", ButtonStyle.PRIMARY)],
         [ib("Failed", "m:failed", "failed", ButtonStyle.DANGER), ib("Help", "m:help", "help", ButtonStyle.PRIMARY)],
