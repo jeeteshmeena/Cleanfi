@@ -300,6 +300,65 @@ def job_kb(jid):
         [ib("Refresh", f"refresh:{jid}", "status", ButtonStyle.PRIMARY)],
     ])
 
+async def launch(jid, m, ids=None):
+    if jid not in jobs:
+        raise ValueError("Unknown Job ID.")
+    j = jobs[jid]
+    if j.get("status") == "running":
+        return await m.reply_text("Job is already running.", reply_markup=job_kb(jid))
+
+    if ids is None:
+        ids = j.get("queue_ids")
+        if not ids:
+            ids = await fetch_batch_ids(jid)
+
+    j["status"] = "running"
+    j["cancel_requested"] = False
+    j["started_at"] = j.get("started_at") or time.time()
+    j.setdefault("stats", {})["started_at"] = j["started_at"]
+    await save()
+    await safe_progress(jid, force=True)
+
+    for mid in list(ids):
+        if j.get("cancel_requested"):
+            j["status"] = "cancelled"
+            break
+        if mid in j.get("processed", []) or mid in j.get("skipped", []) or mid in j.get("failed", []):
+            continue
+        j["current"] = mid
+        try:
+            result, reason = await process_file_with_retry(jid, int(mid))
+            if result == "ok":
+                j["processed"].append(int(mid))
+            elif result == "skip":
+                j["skipped"].append(int(mid))
+            else:
+                j["failed"].append(int(mid))
+                j["failed_reasons"][str(mid)] = reason or "unknown"
+        except Exception as e:
+            j["failed"].append(int(mid))
+            j["failed_reasons"][str(mid)] = f"{type(e).__name__}: {e}"
+            log.exception("JOB %s failed for message %s", jid, mid)
+        j["current"] = None
+        await save()
+        await safe_progress(jid)
+        if j.get("cancel_requested"):
+            j["status"] = "cancelled"
+            break
+        await asyncio.sleep(get_delay(jid))
+
+    if j["status"] == "running":
+        j["status"] = "completed"
+        j.setdefault("stats", {})["finished_at"] = time.time()
+        try:
+            await post_end(jid)
+        except Exception:
+            log.exception("END POST FAILED job=%s", jid)
+    j["current"] = None
+    await save()
+    await safe_progress(jid, force=True)
+    return await m.reply_text(summary(jid), reply_markup=job_kb(jid))
+
 def summary(jid):
     j = jobs[jid]; m = j["meta"]
     return (f"Cleanfi Job {jid}\nRange: {j['start']} → {j['end']}\nStatus: {j['status']}\n"
@@ -330,6 +389,33 @@ async def create_batch_job(owner, first_link, end_link):
     sessions[owner] = jid
     await save()
     return jid
+
+async def handle_batch_link_input(m, text):
+    uid = m.from_user.id
+    if not re.match(r"^https?://t\.me/(?:c/\d+/|[A-Za-z0-9_]+)/\d+(?:\?.*)?$", text):
+        await m.reply_text("Please send a valid Telegram message link.")
+        return True
+    sessions.pop((uid, "batch_first"), None)
+    sessions[(uid, "batch_end")] = text
+    await m.reply_text("First message saved. Now send the END message link.")
+    return True
+
+async def finalize_batch_job(m, first_link, end_link):
+    uid = m.from_user.id
+    sessions.pop((uid, "batch_end"), None)
+    if not settings.get("source") or not settings.get("target"):
+        return await m.reply_text("Set Global Source and Global Target first.", reply_markup=main_kb())
+    try:
+        jid = await create_batch_job(uid, first_link, end_link)
+        await fetch_batch_ids(jid)
+        await m.reply_text(
+            "New Job created successfully.\n\n" + summary(jid),
+            reply_markup=job_kb(jid)
+        )
+    except Exception as e:
+        log.exception("BATCH JOB CREATION FAILED")
+        sessions.pop(uid, None)
+        await m.reply_text(f"Could not create job: {type(e).__name__}: {e}", reply_markup=main_kb())
 
 async def fetch_batch_ids(jid):
     j = jobs[jid]
@@ -1157,7 +1243,25 @@ async def callback_handler(_, q: CallbackQuery):
 
         if data == "m:new":
             await q.answer()
-            return await q.message.reply_text("Use /range START END to create a batch job.", reply_markup=main_kb())
+            if not settings.get("source") or not settings.get("target"):
+                return await q.message.reply_text(
+                    "Set Global Source and Global Target first.",
+                    reply_markup=main_kb()
+                )
+            sessions[(q.from_user.id, "batch_first")] = True
+            sessions.pop((q.from_user.id, "batch_end"), None)
+            return await q.message.reply_text(
+                "New Job\n\nSend the START message link from the source channel.",
+                reply_markup=InlineKeyboardMarkup([
+                    [ib("Cancel", "m:cancel_new", "cancel", ButtonStyle.DANGER)]
+                ])
+            )
+
+        if data == "m:cancel_new":
+            sessions.pop((q.from_user.id, "batch_first"), None)
+            sessions.pop((q.from_user.id, "batch_end"), None)
+            await q.answer("Cancelled")
+            return await q.message.reply_text("CLEANFI", reply_markup=main_kb())
 
         if data == "m:jobs":
             await q.answer()
