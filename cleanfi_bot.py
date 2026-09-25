@@ -1078,14 +1078,15 @@ async def finish_userbot_qr():
     global user_login_client, user_login_task, user_login_qr, user_app
     try:
         await user_login_qr.wait()
-        await user_login_client.disconnect()
-        if USERBOT_SESSION_STRING:
-            # QR login can be persisted as a Telethon StringSession without exposing it to Telegram chat.
-            session = user_login_client.session.save()
-            USERBOT_SESSION_FILE.write_text(session, encoding="utf-8")
-        else:
-            user_login_client.session.save()
+        session = user_login_client.session.save()
+        USERBOT_SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        USERBOT_SESSION_FILE.write_text(session, encoding="utf-8")
+        try:
+            os.chmod(USERBOT_SESSION_FILE, 0o600)
+        except Exception:
+            pass
         user_app = user_login_client
+        user_app.add_event_handler(lambda event: ingest_live_message(event.message, user_app), events.NewMessage())
         user_login_client = None
         user_login_qr = None
         await app.send_message(OWNER_ID, "Userbot login successful.\n\nLive Cleaner can now read channel history and live messages.")
