@@ -827,9 +827,15 @@ async def live_link_timeout():
     live = live_record()
     if not live.get("pending_link"):
         return
+    # Hard 30-minute timeout: do not wait for Yes/Continue.
+    # Reset audio metadata to DEFAULT GLOBAL metadata and still send the
+    # original Pocket FM link + saved cover/image before resuming.
     live["meta"] = newmeta()
     await save()
-    await send_live_link()
+    try:
+        await send_live_link()
+    except Exception:
+        log.exception("LIVE LINK TIMEOUT SEND FAILED")
 
 def live_meta_kb():
     m = live_record().get("meta") or {}
