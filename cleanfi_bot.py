@@ -317,6 +317,15 @@ async def launch(jid, m, ids=None):
     j["started_at"] = j.get("started_at") or time.time()
     j.setdefault("stats", {})["started_at"] = j["started_at"]
     await save()
+
+    # Send the configured Start Post once, before the first episode.
+    # This is intentionally bot-only, just like the normal job processing.
+    try:
+        await post_start(jid)
+    except Exception:
+        log.exception("START POST FAILED job=%s", jid)
+        # A pin/send-post failure must not prevent the actual job from running.
+
     await safe_progress(jid, force=True)
 
     for mid in list(ids):
