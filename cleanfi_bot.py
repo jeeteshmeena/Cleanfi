@@ -9,7 +9,7 @@ from pyrogram.handlers import RawUpdateHandler, MessageHandler
 from pyrogram.file_id import FileId
 from dotenv import load_dotenv
 from mutagen import File as MFile
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
 from metadata import clean_and_apply_metadata, read_original_title
 
@@ -39,7 +39,9 @@ app = Client("cleanfi", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 user_app = None
 user_login_client = None
 user_login_task = None
-user_login_qr = None
+user_login_phone = None
+user_login_code_hash = None
+user_login_prompt_id = None
 jobs, settings, sessions, running = {}, {}, {}, {}
 state_lock = None
 tg_lock = None
@@ -264,11 +266,11 @@ def main_kb():
          ib("Set Target", "m:target", "target", ButtonStyle.PRIMARY)],
         [ib("Delay", "m:delay", "delay", ButtonStyle.PRIMARY),
          ib("New Job", "m:new", "new", ButtonStyle.SUCCESS)],
-        [ib("Live Cleaner", "m:live", "start", ButtonStyle.SUCCESS), ib("Users", "m:users", "status", ButtonStyle.PRIMARY)],
-        [ib("Jobs", "m:jobs", "jobs", ButtonStyle.PRIMARY), ib("Stats", "m:stats", "status", ButtonStyle.PRIMARY)],
-        [ib("Status", "m:status", "status", ButtonStyle.PRIMARY),
-         ib("Failed", "m:failed", "failed", ButtonStyle.DANGER)],
-        [ib("Help", "m:help", "help", ButtonStyle.PRIMARY)],
+        [ib("Live Cleaner", "m:live", "start", ButtonStyle.SUCCESS), ib("Connect Userbot", "m:userbot", "source", ButtonStyle.PRIMARY)],
+        [ib("Users", "m:users", "status", ButtonStyle.PRIMARY), ib("Jobs", "m:jobs", "jobs", ButtonStyle.PRIMARY)],
+        [ib("Stats", "m:stats", "status", ButtonStyle.PRIMARY), ib("Status", "m:status", "status", ButtonStyle.PRIMARY)],
+        [ib("Failed", "m:failed", "failed", ButtonStyle.DANGER), ib("Help", "m:help", "help", ButtonStyle.PRIMARY)],
+        
     ])
 
 def confirm_kb(kind):
@@ -966,6 +968,380 @@ if user_app is not None:
         group=-50
     )
 
+@app.on_callback_query()
+async def callback_handler(_, q: CallbackQuery):
+    """Handle all inline controls from the current Cleanfi UI."""
+    if not q.from_user or q.from_user.id not in settings.get("authorized_users", []):
+        return await q.answer("Not authorized", show_alert=True)
+
+    data = q.data or ""
+    p = data.split(":")
+    try:
+        if data == "m:live":
+            await q.answer()
+            return await q.message.reply_text(live_text(), reply_markup=live_kb())
+
+        if data == "m:userbot":
+            await q.answer()
+            if user_app is not None and await user_app.is_user_authorized():
+                me = await user_app.get_me()
+                return await q.message.reply_text(
+                    f"Userbot connected.\\nAccount: {getattr(me, 'first_name', '')}\\nUser ID: {me.id}",
+                    reply_markup=InlineKeyboardMarkup([
+                        [ib("Refresh", "userbot:status", "status")],
+                        [ib("Disconnect", "userbot:logout", "cancel", ButtonStyle.DANGER)],
+                        [ib("Back", "m:live", "cancel")]
+                    ])
+                )
+            return await q.message.reply_text(
+                "Live Userbot\\n\\nConnect your Telegram account to let Live Cleaner read channel history and live messages.",
+                reply_markup=InlineKeyboardMarkup([
+                    [ib("Login with Phone", "userbot:login", "source", ButtonStyle.SUCCESS)],
+                    [ib("Cancel", "userbot:cancel", "cancel", ButtonStyle.DANGER)]
+                ])
+            )
+
+        if data == "userbot:login":
+            await q.answer()
+            return await begin_phone_userbot_login(q.from_user.id, q.message)
+
+        if data == "userbot:cancel":
+            await q.answer("Cancelled")
+            await cancel_userbot_login()
+            return await q.message.reply_text("Userbot login cancelled.", reply_markup=main_kb())
+
+        if data == "userbot:status":
+            await q.answer()
+            if user_app is not None and await user_app.is_user_authorized():
+                me = await user_app.get_me()
+                return await q.message.reply_text(
+                    f"Userbot connected.\\nAccount: {getattr(me, 'first_name', '')}\\nUser ID: {me.id}",
+                    reply_markup=InlineKeyboardMarkup([
+                        [ib("Refresh", "userbot:status", "status")],
+                        [ib("Disconnect", "userbot:logout", "cancel", ButtonStyle.DANGER)]
+                    ])
+                )
+            return await q.message.reply_text(
+                "Userbot is not connected.",
+                reply_markup=InlineKeyboardMarkup([[ib("Login with Phone", "userbot:login", "source", ButtonStyle.SUCCESS)]])
+            )
+
+        if data == "userbot:logout":
+            await q.answer("Disconnecting...")
+            return await logout_userbot(q.message)
+
+        if data == "m:metadata":
+            await q.answer()
+            return await q.message.reply_text("Global Metadata", reply_markup=global_meta_kb())
+
+        if data in {"m:source", "m:target", "m:delay"}:
+            field = data.split(":")[1]
+            sessions[(q.from_user.id, "global_field")] = field
+            await q.answer()
+            prompt = {
+                "source": "Send the global source chat/channel.",
+                "target": "Send the global target chat/channel.",
+                "delay": f"Send delay in seconds ({MIN_DELAY_SECONDS}-{MAX_DELAY_SECONDS})."
+            }[field]
+            return await q.message.reply_text(prompt)
+
+        if data == "m:new":
+            await q.answer()
+            return await q.message.reply_text("Use /range START END to create a batch job.", reply_markup=main_kb())
+
+        if data == "m:jobs":
+            await q.answer()
+            rows = [f"{x} — {j['status']} — {len(j['processed'])}/{j['total']}" for x,j in list(jobs.items())[-20:]]
+            return await q.message.reply_text("JOBS\\n\\n" + ("\\n".join(rows) or "No jobs."), reply_markup=main_kb())
+
+        if data == "m:stats":
+            await q.answer()
+            return await q.message.reply_text(
+                f"Stats\\n\\nNormal jobs: {sum(1 for x in jobs if x != '__live__')}\\n"
+                f"Live files sent: {live_record().get('stats', {}).get('files_sent', 0)}\\n"
+                f"Live uploaded: {live_record().get('stats', {}).get('bytes_uploaded', 0)/(1024**2):.2f} MB",
+                reply_markup=main_kb()
+            )
+
+        if data == "m:status":
+            await q.answer()
+            rows = [f"{x} — {j['status']} — {len(j['processed'])}/{j['total']}" for x,j in list(jobs.items())[-10:]]
+            return await q.message.reply_text("STATUS\\n\\n" + ("\\n".join(rows) or "No jobs."), reply_markup=main_kb())
+
+        if data == "m:failed":
+            await q.answer()
+            rows = []
+            for x,j in jobs.items():
+                if j.get("failed"):
+                    rows.append(f"{x} — {len(j['failed'])} failed")
+            return await q.message.reply_text("FAILED\\n\\n" + ("\\n".join(rows) or "No failed files."), reply_markup=main_kb())
+
+        if data == "m:users":
+            await q.answer()
+            return await q.message.reply_text(
+                "Authorized Users\\n\\n" + "\\n".join(str(x) for x in authorized_users()),
+                reply_markup=main_kb()
+            )
+
+        if data == "m:help":
+            await q.answer()
+            return await q.message.reply_text(
+                "CLEANFI\\n\\n/range START END\\n/source @channel\\n/target @channel\\n"
+                "/meta artist=... genre=... year=...\\n/cover JOBID\\n/startjob JOBID\\n"
+                "/status JOBID\\n/delay SECONDS\\n/cancel JOBID\\n/retry JOBID\\n/failed JOBID",
+                reply_markup=main_kb()
+            )
+
+        if data == "live:source" or data == "live:target" or data == "live:startid":
+            field = {"live:source":"source", "live:target":"target", "live:startid":"start_id"}[data]
+            sessions[(q.from_user.id, "live_field")] = field
+            await q.answer()
+            prompt = {
+                "source": "Send the Live Source channel username/link/ID.",
+                "target": "Send the Live Target channel username/link/ID.",
+                "start_id": "Send the Telegram message ID from which Live Cleaner should start."
+            }[field]
+            return await q.message.reply_text(prompt)
+
+        if data == "live:meta":
+            await q.answer()
+            return await q.message.reply_text("Live Metadata", reply_markup=live_meta_kb())
+
+        if data == "live:refresh":
+            await q.answer()
+            return await q.message.edit_text(live_text(), reply_markup=live_kb())
+
+        if data == "live:back":
+            await q.answer()
+            return await q.message.reply_text("CLEANFI", reply_markup=main_kb())
+
+        if data == "live:start":
+            await q.answer("Starting Live Cleaner...")
+            try:
+                await start_live()
+                return await q.message.reply_text(live_text(), reply_markup=live_kb())
+            except Exception as e:
+                log.exception("LIVE START FROM INLINE BUTTON FAILED")
+                return await q.message.reply_text(f"Live Cleaner could not start.\\n{type(e).__name__}: {e}", reply_markup=live_kb())
+
+        if data == "live:pause":
+            await pause_live()
+            return await q.answer("Live Cleaner paused.")
+
+        if data == "live:stop":
+            await stop_live()
+            await q.answer("Live Cleaner stopped.")
+            return await q.message.reply_text(live_text(), reply_markup=live_kb())
+
+        if data in {"live:continue", "live:link_skip"}:
+            live_record()["pending_link"] = None
+            live_record()["status"] = "running"
+            jobs["__live__"]["status"] = "running"
+            await save()
+            await q.answer("Continued")
+            return await q.message.reply_text(live_text(), reply_markup=live_kb())
+
+        if data == "live:link_yes":
+            await q.answer()
+            return await q.message.reply_text("Live Metadata", reply_markup=live_meta_kb())
+
+        if data == "live:meta_back":
+            await q.answer()
+            return await q.message.reply_text(live_text(), reply_markup=live_kb())
+
+        if data.startswith("lmeta:"):
+            field = data.split(":", 1)[1]
+            if field not in {"artist","genre","year","album","album_artist","comment"}:
+                return await q.answer("Unknown metadata field", show_alert=True)
+            sessions[(q.from_user.id, "live_field")] = field
+            await q.answer()
+            return await q.message.reply_text(f"Send Live {field.replace('_', ' ')}.")
+
+        if data == "lcover:set":
+            sessions[(q.from_user.id, "live_cover")] = True
+            await q.answer()
+            return await q.message.reply_text("Send the Live Cleaner cover / thumbnail image.")
+
+        if data == "lcover:clear":
+            live_record()["meta"]["cover_path"] = None
+            await save()
+            await q.answer("Cover cleared")
+            return await q.message.edit_text("Live Metadata", reply_markup=live_meta_kb())
+
+        if data.startswith("gm:"):
+            field = data.split(":", 1)[1]
+            if field == "back":
+                await q.answer()
+                return await q.message.reply_text("CLEANFI", reply_markup=main_kb())
+            if field == "cover":
+                sessions[(q.from_user.id, "global_cover")] = True
+                await q.answer()
+                return await q.message.reply_text("Send the global cover image.")
+            if field not in {"artist","genre","year","album","album_artist","comment"}:
+                return await q.answer("Unknown metadata field", show_alert=True)
+            sessions[(q.from_user.id, "global_field")] = field
+            await q.answer()
+            return await q.message.reply_text(f"Send global {field.replace('_', ' ')}.")
+
+        if data.startswith("s:") or data.startswith("genre:") or data.startswith("cover:") or data.startswith("clear:") or data.startswith("startpost:") or data.startswith("start:") or data.startswith("cancel:") or data.startswith("refresh:"):
+            jid = p[-1]
+            if jid not in jobs:
+                return await q.answer("Unknown job", show_alert=True)
+            if data.startswith("s:"):
+                field = p[1]
+                sessions[q.from_user.id] = jid
+                sessions[(q.from_user.id, "field")] = field
+                await q.answer()
+                return await q.message.reply_text(f"Send {field.replace('_',' ')} for Job {jid}.")
+            if data.startswith("cover:"):
+                sessions[q.from_user.id] = jid
+                sessions[(q.from_user.id, "job_cover")] = True
+                await q.answer()
+                return await q.message.reply_text(f"Send the cover image for Job {jid}.")
+            if data.startswith("clear:"):
+                jobs[jid]["meta"]["cover_path"] = None
+                await save()
+                await q.answer("Cover cleared")
+                return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
+            if data.startswith("start:"):
+                await q.answer("Starting...")
+                try:
+                    return await launch(jid, q.message)
+                except Exception as e:
+                    return await q.message.reply_text(f"Could not start job: {type(e).__name__}: {e}", reply_markup=job_kb(jid))
+            if data.startswith("cancel:"):
+                jobs[jid]["cancel_requested"] = True
+                jobs[jid]["status"] = "cancelling"
+                await save()
+                return await q.answer("Cancellation requested")
+            if data.startswith("refresh:"):
+                await q.answer()
+                return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
+            if data.startswith("genre:"):
+                sessions[q.from_user.id] = jid
+                sessions[(q.from_user.id, "field")] = "genre"
+                await q.answer()
+                return await q.message.reply_text("Send genre or use /meta.")
+            if data.startswith("startpost:"):
+                sessions[q.from_user.id] = jid
+                sessions[(q.from_user.id, "startpost")] = True
+                await q.answer()
+                return await q.message.reply_text("Send the Start Post image with its caption.")
+
+        return await q.answer("Unknown button", show_alert=True)
+    except Exception as e:
+        log.exception("INLINE CALLBACK FAILED")
+        try:
+            await q.answer(f"{type(e).__name__}: {e}", show_alert=True)
+        except Exception:
+            pass
+
+async def delete_sensitive_message(message):
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+async def delete_userbot_prompt():
+    global user_login_prompt_id
+    if user_login_prompt_id:
+        try:
+            await app.delete_messages(OWNER_ID, user_login_prompt_id)
+        except Exception:
+            pass
+        user_login_prompt_id = None
+
+async def send_userbot_prompt(text, reply_markup=None):
+    global user_login_prompt_id
+    await delete_userbot_prompt()
+    msg = await app.send_message(OWNER_ID, text, reply_markup=reply_markup)
+    user_login_prompt_id = msg.id
+    return msg
+
+async def cancel_userbot_login():
+    global user_login_client, user_login_task, user_login_phone, user_login_code_hash, user_login_prompt_id
+    if user_login_task and not user_login_task.done():
+        user_login_task.cancel()
+    user_login_task = None
+    user_login_phone = None
+    user_login_code_hash = None
+    for key in ((OWNER_ID, "userbot_field"), (OWNER_ID, "userbot_2fa")):
+        sessions.pop(key, None)
+    await delete_userbot_prompt()
+    if user_login_client:
+        try:
+            await user_login_client.disconnect()
+        except Exception:
+            pass
+    user_login_client = None
+
+async def begin_phone_userbot_login(user_id, message):
+    global user_login_client, user_login_phone, user_login_code_hash
+    if user_login_client is not None:
+        return await send_userbot_prompt(
+            "A userbot login is already in progress. Finish it or press Cancel.",
+            InlineKeyboardMarkup([[ib("Cancel", "userbot:cancel", "cancel", ButtonStyle.DANGER)]])
+        )
+    if user_app is not None and await user_app.is_user_authorized():
+        me = await user_app.get_me()
+        return await send_userbot_prompt(
+            f"Userbot is already connected.\\nAccount: {getattr(me, 'first_name', '')}\\nUser ID: {me.id}",
+            InlineKeyboardMarkup([[ib("Disconnect", "userbot:logout", "cancel", ButtonStyle.DANGER)]])
+        )
+    user_login_client = TelegramClient(StringSession(), USERBOT_API_ID, USERBOT_API_HASH)
+    await user_login_client.connect()
+    user_login_phone = None
+    user_login_code_hash = None
+    sessions[(user_id, "userbot_field")] = "phone"
+    return await send_userbot_prompt(
+        "Userbot Login\\n\\nSend your Telegram phone number in international format.\\n"
+        "Example: +919876543210\\n\\nThis is used only for this login session and is never saved.",
+        InlineKeyboardMarkup([[ib("Cancel", "userbot:cancel", "cancel", ButtonStyle.DANGER)]])
+    )
+
+async def complete_userbot_login():
+    global user_login_client, user_app, user_login_phone, user_login_code_hash, user_login_prompt_id
+    session = user_login_client.session.save()
+    USERBOT_SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    USERBOT_SESSION_FILE.write_text(session, encoding="utf-8")
+    try:
+        os.chmod(USERBOT_SESSION_FILE, 0o600)
+    except Exception:
+        pass
+    user_app = user_login_client
+    user_app.add_event_handler(lambda event: ingest_live_message(event.message, user_app), events.NewMessage())
+    user_login_client = None
+    user_login_phone = None
+    user_login_code_hash = None
+    sessions.pop((OWNER_ID, "userbot_field"), None)
+    sessions.pop((OWNER_ID, "userbot_2fa"), None)
+    await delete_userbot_prompt()
+    me = await user_app.get_me()
+    await app.send_message(
+        OWNER_ID,
+        f"Userbot login successful.\\nAccount: {getattr(me, 'first_name', '')}\\nUser ID: {me.id}\\n\\n"
+        "Live Cleaner can now read channel history and live messages.",
+        reply_markup=live_kb()
+    )
+
+async def logout_userbot(message):
+    global user_app
+    if user_app is None:
+        return await message.reply_text("No userbot is connected.", reply_markup=main_kb())
+    try:
+        await user_app.log_out()
+    except Exception:
+        try:
+            await user_app.disconnect()
+        except Exception:
+            pass
+    user_app = None
+    try:
+        USERBOT_SESSION_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    await message.reply_text("Userbot disconnected and its saved session was deleted.", reply_markup=main_kb())
+
 @app.on_message(filters.private, group=-90)
 async def field_input(_, m):
     if not allowed(m): return
@@ -982,6 +1358,67 @@ async def field_input(_, m):
             return await m.reply_text("Please send a valid Telegram message link.")
         await finalize_batch_job(m, sessions[(m.from_user.id, "batch_end")], text)
         return
+    userbot_field = sessions.get((m.from_user.id, "userbot_field"))
+    if userbot_field:
+        # Phone number, login code and 2FA password are sensitive. Delete the
+        # incoming message immediately and never persist or log its contents.
+        value = text
+        await delete_sensitive_message(m)
+        await delete_userbot_prompt()
+        global user_login_phone, user_login_code_hash
+        try:
+            if userbot_field == "phone":
+                if not re.fullmatch(r"\\+?[0-9][0-9 ()-]{6,20}", value):
+                    return await send_userbot_prompt(
+                        "Invalid phone number format. Send it again in international format.",
+                        InlineKeyboardMarkup([[ib("Cancel", "userbot:cancel", "cancel", ButtonStyle.DANGER)]])
+                    )
+                user_login_phone = value
+                sent = await user_login_client.send_code_request(user_login_phone)
+                user_login_code_hash = sent.phone_code_hash
+                sessions[(m.from_user.id, "userbot_field")] = "code"
+                return await send_userbot_prompt(
+                    "Telegram login code sent. Send the code here.\\n\\n"
+                    "Your code message will be deleted immediately after receipt and is not stored.",
+                    InlineKeyboardMarkup([[ib("Cancel", "userbot:cancel", "cancel", ButtonStyle.DANGER)]])
+                )
+            if userbot_field == "code":
+                if not re.fullmatch(r"[0-9]{4,8}", value):
+                    return await send_userbot_prompt(
+                        "Invalid login code. Send only the Telegram code.",
+                        InlineKeyboardMarkup([[ib("Cancel", "userbot:cancel", "cancel", ButtonStyle.DANGER)]])
+                    )
+                try:
+                    await user_login_client.sign_in(
+                        phone=user_login_phone,
+                        code=value,
+                        phone_code_hash=user_login_code_hash
+                    )
+                except errors.SessionPasswordNeededError:
+                    sessions[(m.from_user.id, "userbot_field")] = "password"
+                    return await send_userbot_prompt(
+                        "Telegram 2-Step Verification is enabled.\\nSend your 2FA password.\\n\\n"
+                        "It will be deleted immediately and never stored.",
+                        InlineKeyboardMarkup([[ib("Cancel", "userbot:cancel", "cancel", ButtonStyle.DANGER)]])
+                    )
+                return await complete_userbot_login()
+            if userbot_field == "password":
+                await user_login_client.sign_in(password=value)
+                return await complete_userbot_login()
+        except (errors.PhoneNumberInvalidError, errors.PhoneCodeInvalidError, errors.PhoneCodeExpiredError):
+            await cancel_userbot_login()
+            return await send_userbot_prompt(
+                "Telegram login failed: invalid or expired login details. Start again.",
+                InlineKeyboardMarkup([[ib("Login with Phone", "userbot:login", "source", ButtonStyle.SUCCESS)]])
+            )
+        except Exception as e:
+            log.exception("USERBOT PHONE LOGIN FAILED")
+            await cancel_userbot_login()
+            return await send_userbot_prompt(
+                f"Telegram login failed: {type(e).__name__}.",
+                InlineKeyboardMarkup([[ib("Login with Phone", "userbot:login", "source", ButtonStyle.SUCCESS)]])
+            )
+
     live_field = sessions.get((m.from_user.id, "live_field"))
     if live_field:
         if live_field == "start_id":
@@ -1076,65 +1513,30 @@ async def connect_saved_userbot():
     log.info("Live userbot connected as %s (%s)", getattr(me, "first_name", ""), me.id)
     return True
 
-async def finish_userbot_qr():
-    global user_login_client, user_login_task, user_login_qr, user_app
-    try:
-        await user_login_qr.wait()
-        session = user_login_client.session.save()
-        USERBOT_SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
-        USERBOT_SESSION_FILE.write_text(session, encoding="utf-8")
-        try:
-            os.chmod(USERBOT_SESSION_FILE, 0o600)
-        except Exception:
-            pass
-        user_app = user_login_client
-        user_app.add_event_handler(lambda event: ingest_live_message(event.message, user_app), events.NewMessage())
-        user_login_client = None
-        user_login_qr = None
-        await app.send_message(OWNER_ID, "Userbot login successful.\n\nLive Cleaner can now read channel history and live messages.")
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        log.exception("USERBOT QR LOGIN FAILED")
-        try:
-            if user_login_client: await user_login_client.disconnect()
-        except Exception: pass
-        user_login_client = None
-        user_login_qr = None
-        await app.send_message(OWNER_ID, f"Userbot login failed: {type(e).__name__}")
-    finally:
-        user_login_task = None
-
 @app.on_message(filters.private & filters.command("userbot"))
 async def userbot_cmd(_, m):
-    global user_login_client, user_login_task, user_login_qr
-    if not is_owner(m): return
+    if not is_owner(m):
+        return
     if user_app is not None and await user_app.is_user_authorized():
         me = await user_app.get_me()
-        return await m.reply_text(f"Userbot connected.\\nAccount: {getattr(me, 'first_name', '')}\\nUser ID: {me.id}")
-    if user_login_task and not user_login_task.done():
-        return await m.reply_text("A userbot login is already waiting. Complete the Telegram QR login or use /userbot_cancel.")
-    user_login_client = TelegramClient(StringSession(), USERBOT_API_ID, USERBOT_API_HASH)
-    await user_login_client.connect()
-    user_login_qr = await user_login_client.qr_login()
-    await m.reply_text(
-        "Live Userbot Login\\n\\n"
-        "No phone number, OTP or 2FA password is entered into Cleanfi.\\n"
-        "Tap the button below and approve the login in Telegram.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Open Telegram Login", url=user_login_qr.url)]])
+        return await m.reply_text(
+            f"Userbot connected.\\nAccount: {getattr(me, 'first_name', '')}\\nUser ID: {me.id}",
+            reply_markup=InlineKeyboardMarkup([
+                [ib("Disconnect", "userbot:logout", "cancel", ButtonStyle.DANGER)],
+                [ib("Back", "m:live", "cancel")]
+            ])
+        )
+    return await m.reply_text(
+        "Live Userbot Login",
+        reply_markup=InlineKeyboardMarkup([[ib("Login with Phone", "userbot:login", "source", ButtonStyle.SUCCESS)]])
     )
-    user_login_task = asyncio.create_task(finish_userbot_qr())
 
 @app.on_message(filters.private & filters.command("userbot_cancel"))
 async def userbot_cancel_cmd(_, m):
-    global user_login_client, user_login_task, user_login_qr
-    if not is_owner(m): return
-    if user_login_task and not user_login_task.done(): user_login_task.cancel()
-    if user_login_client:
-        try: await user_login_client.disconnect()
-        except Exception: pass
-    user_login_client = None; user_login_qr = None; user_login_task = None
-    await m.reply_text("Userbot login cancelled.")
+    if not is_owner(m):
+        return
+    await cancel_userbot_login()
+    await m.reply_text("Userbot login cancelled.", reply_markup=main_kb())
 
 def main():
     load()
