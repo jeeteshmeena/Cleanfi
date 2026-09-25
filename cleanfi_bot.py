@@ -20,9 +20,9 @@ ADMINS = set(ADMIN_IDS_LIST)
 OWNER_ID = int(os.getenv("OWNER_ID", str(ADMIN_IDS_LIST[0] if ADMIN_IDS_LIST else 0)))
 TEMP = Path(os.getenv("TEMP_DIR", "./tmp")); TEMP.mkdir(parents=True, exist_ok=True)
 STATE = Path(os.getenv("STATE_FILE", "./jobs.json"))
-MIN_DELAY_SECONDS = 12
+MIN_DELAY_SECONDS = 3
 MAX_DELAY_SECONDS = 60
-DEFAULT_DELAY_SECONDS = min(MAX_DELAY_SECONDS, max(MIN_DELAY_SECONDS, int(os.getenv("FILE_DELAY_SECONDS", "12"))))
+DEFAULT_DELAY_SECONDS = min(MAX_DELAY_SECONDS, max(MIN_DELAY_SECONDS, int(os.getenv("FILE_DELAY_SECONDS", "3"))))
 MAX_QUEUE = max(1, int(os.getenv("MAX_QUEUED_JOBS", "20")))
 DEFAULT_RETRIES = max(0, int(os.getenv("TRANSIENT_RETRIES", "5")))
 MIN_FREE_DISK_GB = max(0, int(os.getenv("MIN_FREE_DISK_GB", "2")))
@@ -933,6 +933,9 @@ async def run_job(jid, ids=None):
                 await save()
                 await safe_progress(jid, True)
                 if not j.get("cancel_requested"):
+                    # Throttle only between files; Telegram FloodWait remains authoritative.
+                    # With the default 3s delay, normal throughput is allowed to reach ~5-6/min
+                    # depending on download/metadata/upload time without intentionally adding 12s waits.
                     await asyncio.sleep(get_delay(jid))
 
         if j.get("cancel_requested"):
