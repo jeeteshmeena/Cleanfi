@@ -1006,6 +1006,34 @@ async def callback_handler(_, q: CallbackQuery):
             await q.answer()
             return await begin_phone_userbot_login(q.from_user.id, q.message)
 
+        if data == "userbot:resend":
+            global user_login_code_hash, user_login_code_timeout
+            sent_at = sessions.get((q.from_user.id, "userbot_code_sent_at"), 0)
+            if sessions.get((q.from_user.id, "userbot_field")) != "code" or not user_login_client or not user_login_phone or not user_login_code_hash:
+                return await q.answer("No active code request.", show_alert=True)
+            if user_login_code_timeout and time.time() < sent_at + user_login_code_timeout:
+                remaining = max(1, int(sent_at + user_login_code_timeout - time.time()))
+                return await q.answer(f"Please wait {remaining}s before resending.", show_alert=True)
+            try:
+                sent = await user_login_client(functions.auth.ResendCodeRequest(
+                    phone_number=user_login_phone,
+                    phone_code_hash=user_login_code_hash
+                ))
+                user_login_code_hash = sent.phone_code_hash
+                user_login_code_timeout = int(getattr(sent, "timeout", 0) or 0)
+                sessions[(q.from_user.id, "userbot_code_sent_at")] = time.time()
+                await q.answer("Code resent.")
+                return await q.message.edit_text(
+                    "Telegram login code resent. Check your Telegram service chat (777000) and enter the new code.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [ib("Resend Code", "userbot:resend", "source", ButtonStyle.PRIMARY)],
+                        [ib("Cancel", "userbot:cancel", "cancel", ButtonStyle.DANGER)]
+                    ])
+                )
+            except Exception as e:
+                log.exception("USERBOT RESEND FAILED")
+                return await q.answer(f"{type(e).__name__}: {e}", show_alert=True)
+
         if data == "userbot:cancel":
             await q.answer("Cancelled")
             await cancel_userbot_login()
