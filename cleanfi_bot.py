@@ -1368,12 +1368,21 @@ async def field_input(_, m):
         global user_login_phone, user_login_code_hash
         try:
             if userbot_field == "phone":
-                if not re.fullmatch(r"\\+?[0-9][0-9 ()-]{6,20}", value):
+                # Accept normal human-entered Telegram numbers such as:
+                # +919876543210, +91 98765 43210, +91-98765-43210.
+                # Normalize separators before handing the number to Telethon.
+                phone = value.strip()
+                if not re.fullmatch(r"\\+?[0-9][0-9 ()-]{6,20}", phone):
                     return await send_userbot_prompt(
-                        "Invalid phone number format. Send it again in international format.",
+                        "Invalid phone number format. Send it again in international format.\\nExample: +919876543210",
                         InlineKeyboardMarkup([[ib("Cancel", "userbot:cancel", "cancel", ButtonStyle.DANGER)]])
                     )
-                user_login_phone = value
+                user_login_phone = re.sub(r"[ ()-]", "", phone)
+                if not re.fullmatch(r"\\+[0-9]{7,15}", user_login_phone):
+                    return await send_userbot_prompt(
+                        "Please include the country code with +.\\nExample: +919876543210",
+                        InlineKeyboardMarkup([[ib("Cancel", "userbot:cancel", "cancel", ButtonStyle.DANGER)]])
+                    )
                 sent = await user_login_client.send_code_request(user_login_phone)
                 user_login_code_hash = sent.phone_code_hash
                 sessions[(m.from_user.id, "userbot_field")] = "code"
