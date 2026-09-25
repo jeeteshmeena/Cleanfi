@@ -712,6 +712,22 @@ def live_record():
     live.setdefault("current", None)
     return live
 
+def live_meta_kb():
+    m = live_record().get("meta") or {}
+    rows = [
+        [ib(f"Artist: {m.get('artist') or 'Not set'}", "lmeta:artist", "artist")],
+        [ib(f"Genre: {m.get('genre') or 'Not set'}", "lmeta:genre", "genre")],
+        [ib(f"Year: {m.get('year') or 'Not set'}", "lmeta:year", "status")],
+        [ib(f"Album: {m.get('album') or 'Not set'}", "lmeta:album", "genre")],
+        [ib(f"Album Artist: {m.get('album_artist') or 'Not set'}", "lmeta:album_artist", "artist")],
+        [ib(f"Comment: {m.get('comment') or 'Not set'}", "lmeta:comment", "help")]
+    ]
+    if live_record().get("pending_link"):
+        rows.append([ib("Continue", "live:continue", "start", ButtonStyle.SUCCESS)])
+    else:
+        rows.append([ib("Back", "live:meta_back", "cancel")])
+    return InlineKeyboardMarkup(rows)
+
 def live_kb():
     status = live_record().get("status", "stopped")
     controls = ([ib("Pause", "live:pause", "delay"), ib("Stop", "live:stop", "cancel", ButtonStyle.DANGER)]
@@ -1122,6 +1138,61 @@ async def callbacks(_, q: CallbackQuery):
         await q.answer("Cancelled")
         return await q.message.reply_text("Cancelled. No changes were saved.", reply_markup=main_kb())
 
+    if action == "live":
+        sub = parts[1] if len(parts) > 1 else "refresh"
+        if sub == "source" or sub == "target":
+            sessions[(q.from_user.id, "live_field")] = sub
+            await q.answer()
+            return await q.message.reply_text(f"Send Live {sub.title()} channel username or ID.")
+        if sub == "meta":
+            await q.answer()
+            return await q.message.edit_text("Live Cleaner Metadata", reply_markup=live_meta_kb())
+        if sub == "meta_back" or sub == "back":
+            await q.answer()
+            return await q.message.edit_text(live_text(), reply_markup=live_kb())
+        if sub == "continue":
+            pending = live_record().get("pending_link")
+            if not pending: return await q.answer("No pending link", show_alert=True)
+            try:
+                msg = await tg_call(lambda: app.get_messages(int(live_record()["source"]), int(pending["message_id"])), "__live__", "live pending")
+                live_record()["pending_link"] = None
+                live_record()["status"] = "running"; jobs["__live__"]["status"] = "running"
+                live_record()["queued"] = live_record().get("queued", 0) + 1
+                await live_queue.put((msg, dict(live_record().get("meta") or newmeta())))
+                await save(); await q.answer("Live Cleaner resumed")
+                return await q.message.edit_text(live_text(), reply_markup=live_kb())
+            except Exception as e:
+                return await q.answer(f"Could not resume: {type(e).__name__}", show_alert=True)
+        if sub == "link_yes":
+            if not live_record().get("pending_link"): return await q.answer("No pending link", show_alert=True)
+            await q.answer()
+            return await q.message.edit_text("Update Live Metadata, then press Continue.", reply_markup=live_meta_kb())
+        if sub == "link_skip":
+            pending = live_record().get("pending_link")
+            if not pending: return await q.answer("No pending link", show_alert=True)
+            try:
+                msg = await tg_call(lambda: app.get_messages(int(live_record()["source"]), int(pending["message_id"])), "__live__", "live pending")
+                live_record()["pending_link"] = None
+                live_record()["status"] = "running"; jobs["__live__"]["status"] = "running"
+                live_record()["queued"] = live_record().get("queued", 0) + 1
+                await live_queue.put((msg, dict(live_record().get("meta") or newmeta())))
+                await save(); await q.answer("Skipped")
+                return await q.message.edit_text(live_text(), reply_markup=live_kb())
+            except Exception as e:
+                return await q.answer(f"Could not resume: {type(e).__name__}", show_alert=True)
+        if sub == "refresh":
+            await q.answer("Updated")
+            return await q.message.edit_text(live_text(), reply_markup=live_kb())
+        if sub == "start":
+            try: await start_live()
+            except Exception as e: return await q.answer(str(e), show_alert=True)
+            await q.answer("Live Cleaner started")
+            return await q.message.edit_text(live_text(), reply_markup=live_kb())
+        if sub == "pause":
+            await pause_live(); await q.answer("Paused"); return await q.message.edit_text(live_text(), reply_markup=live_kb())
+        if sub == "stop":
+            await stop_live(); await q.answer("Stopped"); return await q.message.edit_text(live_text(), reply_markup=live_kb())
+
     jid = parts[-1]
     if jid not in jobs: return await q.answer("Unknown job", show_alert=True)
     if action == "live":
@@ -1139,6 +1210,14 @@ async def callbacks(_, q: CallbackQuery):
             await q.answer("Updated"); return await q.message.edit_text(live_text(), reply_markup=live_kb())
         if sub == "back":
             await q.answer(); return await q.message.edit_text("CLEANFI", reply_markup=main_kb())
+
+    if action == "lmeta":
+        field = parts[1] if len(parts) > 1 else ""
+        if field in {"artist","genre","year","album","album_artist","comment"}:
+            sessions[(q.from_user.id, "live_field")] = field
+            await q.answer()
+            return await q.message.reply_text(f"Send Live {field.replace('_',' ')}.")
+        return await q.answer("Invalid Live metadata field", show_alert=True)
 
     if action == "refresh":
         await q.answer("Updated")
@@ -1275,6 +1354,24 @@ async def field_input(_, m):
             return await m.reply_text("Please send a valid Telegram message link.")
         await finalize_batch_job(m, sessions[(m.from_user.id, "batch_end")], text)
         return
+    live_field = sessions.get((m.from_user.id, "live_field"))
+    if live_field:
+        if live_field in {"source", "target"}:
+            try:
+                chat = await resolve_chat(text)
+                settings["live"][live_field] = str(chat.id)
+                jobs["__live__"][live_field] = str(chat.id)
+                sessions.pop((m.from_user.id, "live_field"), None)
+                await save()
+                return await m.reply_text(f"Live {live_field.title()} set: {chat.title or chat.first_name}", reply_markup=live_kb())
+            except Exception as e:
+                return await m.reply_text(f"Could not set Live {live_field}: {type(e).__name__}: {e}")
+        if live_field in {"artist","genre","year","album","album_artist","comment"}:
+            live_record()["meta"][live_field] = text
+            sessions.pop((m.from_user.id, "live_field"), None)
+            await save()
+            return await m.reply_text("Live metadata updated.", reply_markup=live_meta_kb())
+
     global_field = sessions.get((m.from_user.id, "global_field"))
     if global_field:
         if global_field in {"artist","album","album_artist","year","comment"}:
