@@ -1346,7 +1346,11 @@ async def logout_userbot(message):
 async def field_input(_, m):
     if not allowed(m): return
     text = (m.text or "").strip()
-    log.info("TEXT INPUT user=%s text=%s global_field=%s job_field=%s active=%s", m.from_user.id, text, sessions.get((m.from_user.id, "global_field")), sessions.get((m.from_user.id, "field")), sessions.get(m.from_user.id))
+    userbot_input = sessions.get((m.from_user.id, "userbot_field"))
+    if userbot_input:
+        log.info("USERBOT SENSITIVE INPUT received user=%s field=%s", m.from_user.id, userbot_input)
+    else:
+        log.info("TEXT INPUT user=%s text=%s global_field=%s job_field=%s active=%s", m.from_user.id, text, sessions.get((m.from_user.id, "global_field")), sessions.get((m.from_user.id, "field")), sessions.get(m.from_user.id))
     if text.startswith("/"):
         return
     # Handle the two-step Batch link flow before generic metadata input.
@@ -1377,9 +1381,9 @@ async def field_input(_, m):
                 # and an optional leading + so valid numbers are not rejected
                 # by the UI validator.
                 if phone.startswith("+"):
-                    user_login_phone = "+" + re.sub(r"\\D", "", phone)
+                    user_login_phone = "+" + re.sub(r"\D", "", phone)
                 else:
-                    user_login_phone = re.sub(r"\\D", "", phone)
+                    user_login_phone = re.sub(r"\D", "", phone)
                 digits = user_login_phone[1:] if user_login_phone.startswith("+") else user_login_phone
                 if not (7 <= len(digits) <= 15):
                     return await send_userbot_prompt(
