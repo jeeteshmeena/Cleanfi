@@ -69,13 +69,17 @@ def load():
     settings.setdefault("source", os.getenv("SOURCE_CHAT_ID", ""))
     settings.setdefault("authorized_users", [OWNER_ID])
     settings["authorized_users"] = sorted({OWNER_ID} | {int(x) for x in settings.get("authorized_users", [])})
-    settings.setdefault("live", {"status": "stopped", "source": "", "target": "", "meta": {}, "stats": {"files_sent": 0, "bytes_downloaded": 0, "bytes_uploaded": 0}, "pending_link": None})
+    settings.setdefault("live", {"status": "stopped", "source": "", "target": "", "meta": {}, "stats": {"files_sent": 0, "bytes_downloaded": 0, "bytes_uploaded": 0}, "pending_link": None, "start_id": 0})
     if settings["live"].get("status") in {"running", "paused"}:
         settings["live"]["status"] = "stopped"
-    jobs.setdefault("__live__", {"id":"__live__","owner":OWNER_ID,"source":settings["live"].get("source") or "","target":settings["live"].get("target") or "","start":0,"end":0,"total":0,"processed":[],"failed":[],"skipped":[],"failed_reasons":{},"status":"stopped","cancel_requested":False,"meta":settings["live"].get("meta") or {},"delay_seconds":int(settings.get("file_delay", DEFAULT_DELAY_SECONDS)),"stats":settings["live"].get("stats", {"files_sent":0,"bytes_downloaded":0,"bytes_uploaded":0}),"current":None})
+    jobs.setdefault("__live__", {"id":"__live__","owner":OWNER_ID,"source":settings["live"].get("source") or "","target":settings["live"].get("target") or "","start":int(settings["live"].get("start_id") or 0),"end":0,"total":0,"processed":[],"failed":[],"skipped":[],"failed_reasons":{},"status":"stopped","cancel_requested":False,"meta":settings["live"].get("meta") or {},"delay_seconds":int(settings.get("file_delay", DEFAULT_DELAY_SECONDS)),"stats":settings["live"].get("stats", {"files_sent":0,"bytes_downloaded":0,"bytes_uploaded":0}),"current":None})
     if not jobs["__live__"]["meta"]:
         jobs["__live__"]["meta"] = newmeta()
     settings["live"]["meta"] = jobs["__live__"]["meta"]
+    settings["live"].setdefault("source", jobs["__live__"].get("source") or "")
+    settings["live"].setdefault("target", jobs["__live__"].get("target") or "")
+    settings["live"].setdefault("start_id", int(jobs["__live__"].get("start_id") or 0))
+    settings["live"].setdefault("backlog_loaded", False)
     settings.setdefault("target", os.getenv("TARGET_CHAT_ID", ""))
     settings.setdefault("retries", DEFAULT_RETRIES)
     settings.setdefault("file_delay", DEFAULT_DELAY_SECONDS)
@@ -537,6 +541,24 @@ async def cover_media(_, m):
             log.exception("GLOBAL COVER DOWNLOAD FAILED user=%s", m.from_user.id)
             await m.reply_text(f"Global cover download failed: {type(e).__name__}: {e}")
         return
+    if sessions.get((m.from_user.id, "live_cover")):
+        image = m.photo or (m.document if m.document and (m.document.mime_type or "").startswith("image/") else None)
+        if not image:
+            return await m.reply_text("Please send an image for the Live Cleaner cover / thumbnail.")
+        d = TEMP / "live"
+        d.mkdir(exist_ok=True)
+        path = d / f"cover_{uuid.uuid4().hex}.jpg"
+        try:
+            await tg_call(lambda: m.download(file_name=str(path)), "__live__", "live cover download")
+            live_record()["meta"]["cover_path"] = str(path)
+            sessions.pop((m.from_user.id, "live_cover"), None)
+            await save()
+            log.info("LIVE COVER SAVED user=%s path=%s", m.from_user.id, path)
+            return await m.reply_text("Live Cleaner cover / thumbnail saved.", reply_markup=live_meta_kb())
+        except Exception as e:
+            log.exception("LIVE COVER SAVE FAILED user=%s", m.from_user.id)
+            return await m.reply_text(f"Live cover save failed: {type(e).__name__}: {e}", reply_markup=live_meta_kb())
+
     jid = sessions.get(m.from_user.id) if sessions.get((m.from_user.id, "job_cover")) else active(m)
     if not jid or jid not in jobs:
         return await m.reply_text("Create/select a job first, then use the Cover button.")
@@ -706,6 +728,9 @@ async def process_file_with_retry(jid, mid, message=None, meta_override=None):
 def live_record():
     live = settings.setdefault("live", {})
     live.setdefault("status", "stopped")
+    live.setdefault("source", "")
+    live.setdefault("target", "")
+    live.setdefault("start_id", 0)
     live.setdefault("meta", jobs.get("__live__", {}).get("meta") or newmeta())
     live.setdefault("stats", jobs.get("__live__", {}).get("stats", {"files_sent": 0, "bytes_downloaded": 0, "bytes_uploaded": 0}))
     live.setdefault("queued", 0)
@@ -714,13 +739,16 @@ def live_record():
 
 def live_meta_kb():
     m = live_record().get("meta") or {}
+    cover = "Attached" if m.get("cover_path") else "Not set"
     rows = [
         [ib(f"Artist: {m.get('artist') or 'Not set'}", "lmeta:artist", "artist")],
         [ib(f"Genre: {m.get('genre') or 'Not set'}", "lmeta:genre", "genre")],
         [ib(f"Year: {m.get('year') or 'Not set'}", "lmeta:year", "status")],
         [ib(f"Album: {m.get('album') or 'Not set'}", "lmeta:album", "genre")],
         [ib(f"Album Artist: {m.get('album_artist') or 'Not set'}", "lmeta:album_artist", "artist")],
-        [ib(f"Comment: {m.get('comment') or 'Not set'}", "lmeta:comment", "help")]
+        [ib(f"Comment: {m.get('comment') or 'Not set'}", "lmeta:comment", "help")],
+        [ib(f"Cover / Thumbnail: {cover}", "lcover:set", "cover")],
+        [ib("Clear Cover", "lcover:clear", "cancel", ButtonStyle.DANGER)]
     ]
     if live_record().get("pending_link"):
         rows.append([ib("Continue", "live:continue", "start", ButtonStyle.SUCCESS)])
@@ -735,19 +763,20 @@ def live_kb():
                 [ib("Resume", "live:start", "start", ButtonStyle.SUCCESS), ib("Stop", "live:stop", "cancel", ButtonStyle.DANGER)]
                 if status == "paused" else
                 [ib("START", "live:start", "start", ButtonStyle.SUCCESS)])
-    return InlineKeyboardMarkup([controls, [ib("Live Source", "live:source", "source"), ib("Live Target", "live:target", "target")], [ib("Live Metadata", "live:meta", "genre")], [ib("Refresh", "live:refresh", "status")], [ib("Back", "live:back", "cancel", ButtonStyle.DANGER)]])
+    return InlineKeyboardMarkup([controls, [ib("Live Source", "live:source", "source"), ib("Live Target", "live:target", "target")], [ib(f"Start ID: {live_record().get('start_id') or 'Not set'}", "live:startid", "status")], [ib("Live Metadata", "live:meta", "genre")], [ib("Refresh", "live:refresh", "status")], [ib("Back", "live:back", "cancel", ButtonStyle.DANGER)]])
 
 def live_text():
     live = live_record(); s = live.get("stats", {})
     return (f"Live Cleaner\n\nStatus: {live.get('status','stopped').title()}\n"
-            f"Source: {settings.get('source') or 'Not set'}\nTarget: {settings.get('target') or 'Not set'}\n"
+            f"Source: {live.get('source') or 'Not set'}\nTarget: {live.get('target') or 'Not set'}\nStart ID: {live.get('start_id') or 'Not set'}\n"
             f"Queued: {live.get('queued', 0)}\nCurrent: {live.get('current') or 'Idle'}\n\n"
             f"Files sent: {s.get('files_sent', 0)}\nData uploaded: {s.get('bytes_uploaded', 0)/(1024**2):.2f} MB")
 
 async def live_worker():
     global live_queue
+    queue = live_queue
     while True:
-        item = await live_queue.get()
+        item = await queue.get()
         msg, queued_meta = item if isinstance(item, tuple) else (item, None)
         live = live_record()
         try:
@@ -757,34 +786,62 @@ async def live_worker():
                 continue
             live["current"] = msg.id
             live["queued"] = max(0, live.get("queued", 0) - 1)
-            # Reuse the same isolated cleaning pipeline, but use the received message directly.
             result, reason = await process_file_with_retry("__live__", msg.id, message=msg, meta_override=queued_meta)
             if result == "ok":
                 live["stats"]["files_sent"] = live["stats"].get("files_sent", 0) + 1
             await save()
             if live.get("status") == "running":
                 await asyncio.sleep(get_delay("__live__"))
+        except asyncio.CancelledError:
+            raise
         except Exception:
             log.exception("Live cleaner failed for message %s", msg.id)
         finally:
             live["current"] = None
+            try:
+                queue.task_done()
+            except Exception:
+                pass
             await save()
-            live_queue.task_done()
 
 async def start_live():
     global live_queue, live_task
     live = live_record()
     if not live.get("source") or not live.get("target"):
         raise ValueError("Set Live Source and Live Target first.")
+    start_id = int(live.get("start_id") or 0)
+    if start_id <= 0:
+        raise ValueError("Set Live Start ID first.")
     await resolve_chat(live["source"]); await resolve_chat(live["target"])
     jobs["__live__"]["source"] = live["source"]
     jobs["__live__"]["target"] = live["target"]
+    jobs["__live__"]["start_id"] = start_id
     live = live_record()
     live["status"] = "running"
+    live["pending_link"] = None
     jobs["__live__"]["status"] = "running"
-    if live_queue is None: live_queue = asyncio.Queue()
-    if live_task is None or live_task.done(): live_task = asyncio.create_task(live_worker())
-    await save()
+    if live_queue is None:
+        live_queue = asyncio.Queue()
+    if live_task is None or live_task.done():
+        live_task = asyncio.create_task(live_worker())
+
+    # First start is deterministic: queue existing audio from Start ID through the
+    # newest available message in chronological order, then keep listening for new posts.
+    if not live.get("backlog_loaded"):
+        backlog = []
+        async for msg in app.get_chat_history(int(live["source"])):
+            if msg.id < start_id:
+                break
+            media = msg.audio or (msg.document if msg.document and (getattr(msg.document, "mime_type", "") or "").startswith("audio/") else None)
+            if media:
+                body = " ".join(x for x in [(msg.text or ""), (msg.caption or "")] if x)
+                if not re.search(r"https?://pocketfm\\.com/show(?:/|\\b)", body, re.I):
+                    backlog.append(msg)
+        for msg in reversed(backlog):
+            live["queued"] = live.get("queued", 0) + 1
+            await live_queue.put((msg, dict(live.get("meta") or newmeta())))
+        live["backlog_loaded"] = True
+        await save()
 
 async def pause_live():
     live_record()["status"] = "paused"
@@ -805,6 +862,7 @@ async def live_channel_handler(_, m):
     if live.get("status") != "running" or live_queue is None: return
     try:
         if int(m.chat.id) != int(live.get("source")): return
+        if int(m.id) < int(live.get("start_id") or 0): return
     except Exception: return
     body = " ".join(x for x in [(m.text or ""), (m.caption or "")] if x)
     if re.search(r"https?://pocketfm\.com/show(?:/|\b)", body, re.I):
@@ -1144,6 +1202,10 @@ async def callbacks(_, q: CallbackQuery):
             sessions[(q.from_user.id, "live_field")] = sub
             await q.answer()
             return await q.message.reply_text(f"Send Live {sub.title()} channel username or ID.")
+        if sub == "startid":
+            sessions[(q.from_user.id, "live_field")] = "start_id"
+            await q.answer()
+            return await q.message.reply_text("Send the Telegram message ID from which Live Cleaner should start.")
         if sub == "meta":
             await q.answer()
             return await q.message.edit_text("Live Cleaner Metadata", reply_markup=live_meta_kb())
@@ -1210,6 +1272,19 @@ async def callbacks(_, q: CallbackQuery):
             await q.answer("Updated"); return await q.message.edit_text(live_text(), reply_markup=live_kb())
         if sub == "back":
             await q.answer(); return await q.message.edit_text("CLEANFI", reply_markup=main_kb())
+
+    if action == "lcover":
+        sub = parts[1] if len(parts) > 1 else ""
+        if sub == "set":
+            sessions[(q.from_user.id, "live_cover")] = True
+            await q.answer()
+            return await q.message.reply_text("Send the Live Cleaner cover / thumbnail image now. No caption is required.")
+        if sub == "clear":
+            live_record()["meta"]["cover_path"] = None
+            await save()
+            await q.answer("Cover cleared")
+            return await q.message.edit_text("Live Cleaner Metadata", reply_markup=live_meta_kb())
+        return await q.answer("Invalid Live cover action", show_alert=True)
 
     if action == "lmeta":
         field = parts[1] if len(parts) > 1 else ""
@@ -1356,6 +1431,15 @@ async def field_input(_, m):
         return
     live_field = sessions.get((m.from_user.id, "live_field"))
     if live_field:
+        if live_field == "start_id":
+            if not text.isdigit() or int(text) <= 0:
+                return await m.reply_text("Live Start ID must be a positive Telegram message ID.")
+            live_record()["start_id"] = int(text)
+            live_record()["backlog_loaded"] = False
+            jobs["__live__"]["start_id"] = int(text)
+            sessions.pop((m.from_user.id, "live_field"), None)
+            await save()
+            return await m.reply_text(f"Live Start ID set to {text}.\nLive Cleaner will start from this message ID.", reply_markup=live_kb())
         if live_field in {"source", "target"}:
             try:
                 chat = await resolve_chat(text)
