@@ -392,10 +392,10 @@ async def create_batch_job(owner, first_link, end_link):
 
 def parse_telegram_message_link(text):
     text = (text or "").strip()
-    m = re.match(r"^https?://t\\.me/c/(\\d+)/(\\d+)(?:\\?.*)?$", text)
+    m = re.fullmatch(r"https?://t\.me/c/(\d+)/(\d+)(?:\?.*)?", text)
     if m:
         return {"chat": int("-100" + m.group(1)), "message_id": int(m.group(2))}
-    m = re.match(r"^https?://t\\.me/([A-Za-z0-9_]+)/(\\d+)(?:\\?.*)?$", text)
+    m = re.fullmatch(r"https?://t\.me/([A-Za-z0-9_]+)/(\d+)(?:\?.*)?", text)
     if m:
         return {"chat": m.group(1), "message_id": int(m.group(2))}
     return None
