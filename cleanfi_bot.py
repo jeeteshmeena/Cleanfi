@@ -69,10 +69,10 @@ def load():
     settings.setdefault("source", os.getenv("SOURCE_CHAT_ID", ""))
     settings.setdefault("authorized_users", [OWNER_ID])
     settings["authorized_users"] = sorted({OWNER_ID} | {int(x) for x in settings.get("authorized_users", [])})
-    settings.setdefault("live", {"status": "stopped", "meta": {}, "stats": {"files_sent": 0, "bytes_downloaded": 0, "bytes_uploaded": 0}})
+    settings.setdefault("live", {"status": "stopped", "source": "", "target": "", "meta": {}, "stats": {"files_sent": 0, "bytes_downloaded": 0, "bytes_uploaded": 0}, "pending_link": None})
     if settings["live"].get("status") in {"running", "paused"}:
         settings["live"]["status"] = "stopped"
-    jobs.setdefault("__live__", {"id":"__live__","owner":OWNER_ID,"source":settings["source"],"target":settings["target"],"start":0,"end":0,"total":0,"processed":[],"failed":[],"skipped":[],"failed_reasons":{},"status":"stopped","cancel_requested":False,"meta":settings["live"].get("meta") or {},"delay_seconds":int(settings.get("file_delay", DEFAULT_DELAY_SECONDS)),"stats":settings["live"].get("stats", {"files_sent":0,"bytes_downloaded":0,"bytes_uploaded":0}),"current":None})
+    jobs.setdefault("__live__", {"id":"__live__","owner":OWNER_ID,"source":settings["live"].get("source") or "","target":settings["live"].get("target") or "","start":0,"end":0,"total":0,"processed":[],"failed":[],"skipped":[],"failed_reasons":{},"status":"stopped","cancel_requested":False,"meta":settings["live"].get("meta") or {},"delay_seconds":int(settings.get("file_delay", DEFAULT_DELAY_SECONDS)),"stats":settings["live"].get("stats", {"files_sent":0,"bytes_downloaded":0,"bytes_uploaded":0}),"current":None})
     if not jobs["__live__"]["meta"]:
         jobs["__live__"]["meta"] = newmeta()
     settings["live"]["meta"] = jobs["__live__"]["meta"]
@@ -647,8 +647,9 @@ async def download_media_direct(media, path, jid):
         jobs[jid].setdefault("stats", {})["bytes_downloaded"] = jobs[jid].get("stats", {}).get("bytes_downloaded", 0) + written
     return path
 
-async def process_file(jid, mid, message=None):
+async def process_file(jid, mid, message=None, meta_override=None):
     j = jobs[jid]
+    meta = meta_override or j["meta"]
     if MIN_FREE_DISK_GB and __import__("shutil").disk_usage(TEMP).free < MIN_FREE_DISK_GB * 1024**3:
         return "failed", f"Low disk space: less than {MIN_FREE_DISK_GB} GB free"
     msg = message or await tg_call(lambda: app.get_messages(int(j["source"]), mid), jid, "get_messages")
@@ -670,13 +671,13 @@ async def process_file(jid, mid, message=None):
             except Exception: title = None
         title = title if title is not None else Path(name).stem
         await asyncio.to_thread(clean_and_apply_metadata, str(inp), str(out), title=title,
-            artist=j["meta"].get("artist"), genre=j["meta"].get("genre"), year=j["meta"].get("year"),
-            cover=j["meta"].get("cover_path"), album=j["meta"].get("album"),
-            album_artist=j["meta"].get("album_artist"), comment=j["meta"].get("comment"))
+            artist=meta.get("artist"), genre=meta.get("genre"), year=meta.get("year"),
+            cover=meta.get("cover_path"), album=meta.get("album"),
+            album_artist=meta.get("album_artist"), comment=meta.get("comment"))
         upload_bytes = out.stat().st_size if out.exists() else 0
         kw = {"audio": str(out), "caption": msg.caption or "", "file_name": name, "title": str(title)}
-        if j["meta"].get("artist"): kw["performer"] = str(j["meta"]["artist"])
-        cp = j["meta"].get("cover_path")
+        if meta.get("artist"): kw["performer"] = str(meta["artist"])
+        cp = meta.get("cover_path")
         if cp and Path(cp).is_file(): kw["thumb"] = cp
         await tg_call(lambda: app.send_audio(int(j["target"]), **kw), jid, "upload")
         j.setdefault("stats", {})["files_sent"] = j.get("stats", {}).get("files_sent", 0) + 1
@@ -687,11 +688,11 @@ async def process_file(jid, mid, message=None):
             try: p.unlink()
             except FileNotFoundError: pass
 
-async def process_file_with_retry(jid, mid, message=None):
+async def process_file_with_retry(jid, mid, message=None, meta_override=None):
     attempt = 0
     while True:
         try:
-            return await process_file(jid, mid, message=message)
+            return await process_file(jid, mid, message=message, meta_override=meta_override)
         except FloodWait:
             raise
         except Exception:
@@ -730,7 +731,8 @@ def live_text():
 async def live_worker():
     global live_queue
     while True:
-        msg = await live_queue.get()
+        item = await live_queue.get()
+        msg, queued_meta = item if isinstance(item, tuple) else (item, None)
         live = live_record()
         try:
             while live.get("status") == "paused":
@@ -740,7 +742,7 @@ async def live_worker():
             live["current"] = msg.id
             live["queued"] = max(0, live.get("queued", 0) - 1)
             # Reuse the same isolated cleaning pipeline, but use the received message directly.
-            result, reason = await process_file_with_retry("__live__", msg.id, message=msg)
+            result, reason = await process_file_with_retry("__live__", msg.id, message=msg, meta_override=queued_meta)
             if result == "ok":
                 live["stats"]["files_sent"] = live["stats"].get("files_sent", 0) + 1
             await save()
