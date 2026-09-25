@@ -1069,6 +1069,7 @@ async def connect_saved_userbot():
         await user_app.disconnect()
         user_app = None
         return False
+    user_app.add_event_handler(lambda event: ingest_live_message(event.message, user_app), events.NewMessage())
     me = await user_app.get_me()
     log.info("Live userbot connected as %s (%s)", getattr(me, "first_name", ""), me.id)
     return True
