@@ -9,6 +9,8 @@ from pyrogram.handlers import RawUpdateHandler, MessageHandler
 from pyrogram.file_id import FileId
 from dotenv import load_dotenv
 from mutagen import File as MFile
+from telethon import TelegramClient
+from telethon.sessions import StringSession
 from metadata import clean_and_apply_metadata, read_original_title
 
 load_dotenv()
@@ -33,7 +35,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 log = logging.getLogger("cleanfi")
 
 app = Client("cleanfi", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-user_app = Client("cleanfi_user", api_id=USERBOT_API_ID, api_hash=USERBOT_API_HASH, session_string=USERBOT_SESSION_STRING) if USERBOT_SESSION_STRING else None
+user_app = None
+user_login_client = None
+user_login_task = None
+user_login_qr = None
 jobs, settings, sessions, running = {}, {}, {}, {}
 state_lock = None
 tg_lock = None
@@ -660,15 +665,21 @@ async def test_cmd(_, m):
     jid = await create_job(m.from_user.id, int(p[1]), int(p[1]))
     await m.reply_text(summary(jid), reply_markup=job_kb(jid))
 
-async def download_media_direct(media, path, jid, client=None):
-    """Download through Pyrogram's media generator so FloodWait is not swallowed by Message.download()."""
+async def download_media_direct(media, path, jid, client=None, message=None):
+    """Download source media using either Pyrogram or the Telegram user client."""
     client = client or app
-    file_id = FileId.decode(media.file_id)
-    written = 0
-    with open(path, "wb") as fp:
-        async for chunk in client.get_file(file_id, file_size=getattr(media, "file_size", 0) or 0):
-            fp.write(chunk)
-            written += len(chunk)
+    if isinstance(client, TelegramClient):
+        if message is None:
+            raise RuntimeError("Telethon source message is required")
+        await client.download_media(message, file=path)
+        written = Path(path).stat().st_size if Path(path).exists() else 0
+    else:
+        file_id = FileId.decode(media.file_id)
+        written = 0
+        with open(path, "wb") as fp:
+            async for chunk in client.get_file(file_id, file_size=getattr(media, "file_size", 0) or 0):
+                fp.write(chunk)
+                written += len(chunk)
     if written <= 0:
         raise RuntimeError("Telegram returned an empty media download")
     if jid and jobs.get(jid):
@@ -682,9 +693,15 @@ async def process_file(jid, mid, message=None, meta_override=None, source_client
         return "failed", f"Low disk space: less than {MIN_FREE_DISK_GB} GB free"
     source_client = source_client or app
     msg = message or await tg_call(lambda: source_client.get_messages(int(j["source"]), mid), jid, "get_messages")
-    media = msg.audio or (msg.document if msg.document and (getattr(msg.document, "mime_type", "") or "").startswith("audio/") else None)
+    if isinstance(source_client, TelegramClient):
+        media = getattr(msg, "audio", None) or (msg.document if getattr(msg, "document", None) and str(getattr(msg.document, "mime_type", "") or "").startswith("audio/") else None)
+        name = getattr(getattr(msg, "file", None), "name", None) or f"{mid}.mp3"
+        caption = getattr(msg, "text", "") or ""
+    else:
+        media = msg.audio or (msg.document if msg.document and (getattr(msg.document, "mime_type", "") or "").startswith("audio/") else None)
+        name = infer_name(media) if media else f"{mid}.mp3"
+        caption = msg.caption or ""
     if not media: return "skip", "message has no audio media"
-    name = infer_name(media)
     ext = Path(name).suffix.lower()
     supported = {".mp3",".m4a",".mp4",".flac",".ogg",".opus",".wav",".aiff",".aif",".wma",".aac"}
     if ext not in supported: return "skip", f"unsupported container {ext or 'unknown'}"
@@ -692,7 +709,7 @@ async def process_file(jid, mid, message=None, meta_override=None, source_client
     d = TEMP / jid; d.mkdir(exist_ok=True)
     inp = d / f"{mid}_{Path(name).name}"; out = d / f"out_{mid}_{Path(name).name}"
     try:
-        await download_media_direct(media, str(inp), jid, client=source_client)
+        await download_media_direct(media, str(inp), jid, client=source_client, message=msg)
         title = read_original_title(str(inp))
         if title is None:
             try:
@@ -704,7 +721,7 @@ async def process_file(jid, mid, message=None, meta_override=None, source_client
             cover=meta.get("cover_path"), album=meta.get("album"),
             album_artist=meta.get("album_artist"), comment=meta.get("comment"))
         upload_bytes = out.stat().st_size if out.exists() else 0
-        kw = {"audio": str(out), "caption": msg.caption or "", "file_name": name, "title": str(title)}
+        kw = {"audio": str(out), "caption": caption, "file_name": name, "title": str(title)}
         if meta.get("artist"): kw["performer"] = str(meta["artist"])
         cp = meta.get("cover_path")
         if cp and Path(cp).is_file(): kw["thumb"] = cp
@@ -862,7 +879,7 @@ async def start_live():
         live_task = asyncio.create_task(live_worker())
 
     history = []
-    async for msg in user_app.get_chat_history(int(live["source"])):
+    async for msg in user_app.iter_messages(int(live["source"])):
         if int(msg.id) < start_id:
             break
         history.append(msg)
@@ -910,7 +927,7 @@ async def ingest_live_message(m, source_client):
     if live.get("status") not in {"starting", "running", "paused"} or live_queue is None:
         return
     try:
-        if int(m.chat.id) != int(live.get("source")) or int(m.id) < int(live.get("start_id") or 0):
+        if int(getattr(m.chat, "id", getattr(m, "chat_id", 0))) != int(live.get("source")) or int(m.id) < int(live.get("start_id") or 0):
             return
     except Exception:
         return
@@ -918,9 +935,9 @@ async def ingest_live_message(m, source_client):
     if mid in live_seen_ids:
         return
     live_seen_ids.add(mid)
-    body = " ".join(x for x in [(m.text or ""), (m.caption or "")] if x)
+    body = " ".join(x for x in [(getattr(m, "text", "") or ""), (getattr(m, "caption", "") or "")] if x)
     is_link = bool(re.search(r"https?://pocketfm\.com/show(?:/|\b)", body, re.I))
-    media = m.audio or (m.document if m.document and (getattr(m.document, "mime_type", "") or "").startswith("audio/") else None)
+    media = getattr(m, "audio", None) or (m.document if getattr(m, "document", None) and (getattr(m.document, "mime_type", "") or "").startswith("audio/") else None)
     if live.get("loading_backlog"):
         live.setdefault("ingest_buffer", []).append(m)
         return
@@ -1038,26 +1055,97 @@ async def field_input(_, m):
             reply_markup=confirm_kb("job")
         )
 
+async def connect_saved_userbot():
+    global user_app
+    if USERBOT_SESSION_STRING:
+        user_app = TelegramClient(StringSession(USERBOT_SESSION_STRING), USERBOT_API_ID, USERBOT_API_HASH)
+    elif USERBOT_SESSION_FILE.exists():
+        user_app = TelegramClient(str(USERBOT_SESSION_FILE), USERBOT_API_ID, USERBOT_API_HASH)
+    else:
+        return False
+    await user_app.connect()
+    if not await user_app.is_user_authorized():
+        await user_app.disconnect()
+        user_app = None
+        return False
+    me = await user_app.get_me()
+    log.info("Live userbot connected as %s (%s)", getattr(me, "first_name", ""), me.id)
+    return True
+
+async def finish_userbot_qr():
+    global user_login_client, user_login_task, user_login_qr, user_app
+    try:
+        await user_login_qr.wait()
+        await user_login_client.disconnect()
+        if USERBOT_SESSION_STRING:
+            # QR login can be persisted as a Telethon StringSession without exposing it to Telegram chat.
+            session = user_login_client.session.save()
+            USERBOT_SESSION_FILE.write_text(session, encoding="utf-8")
+        else:
+            user_login_client.session.save()
+        user_app = user_login_client
+        user_login_client = None
+        user_login_qr = None
+        await app.send_message(OWNER_ID, "Userbot login successful.\n\nLive Cleaner can now read channel history and live messages.")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.exception("USERBOT QR LOGIN FAILED")
+        try:
+            if user_login_client: await user_login_client.disconnect()
+        except Exception: pass
+        user_login_client = None
+        user_login_qr = None
+        await app.send_message(OWNER_ID, f"Userbot login failed: {type(e).__name__}")
+    finally:
+        user_login_task = None
+
+@app.on_message(filters.private & filters.command("userbot"))
+async def userbot_cmd(_, m):
+    global user_login_client, user_login_task, user_login_qr
+    if not is_owner(m): return
+    if user_app is not None and await user_app.is_user_authorized():
+        me = await user_app.get_me()
+        return await m.reply_text(f"Userbot connected.\\nAccount: {getattr(me, 'first_name', '')}\\nUser ID: {me.id}")
+    if user_login_task and not user_login_task.done():
+        return await m.reply_text("A userbot login is already waiting. Complete the Telegram QR login or use /userbot_cancel.")
+    user_login_client = TelegramClient(StringSession(), USERBOT_API_ID, USERBOT_API_HASH)
+    await user_login_client.connect()
+    user_login_qr = await user_login_client.qr_login()
+    await m.reply_text(
+        "Live Userbot Login\\n\\n"
+        "No phone number, OTP or 2FA password is entered into Cleanfi.\\n"
+        "Tap the button below and approve the login in Telegram.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Open Telegram Login", url=user_login_qr.url)]])
+    )
+    user_login_task = asyncio.create_task(finish_userbot_qr())
+
+@app.on_message(filters.private & filters.command("userbot_cancel"))
+async def userbot_cancel_cmd(_, m):
+    global user_login_client, user_login_task, user_login_qr
+    if not is_owner(m): return
+    if user_login_task and not user_login_task.done(): user_login_task.cancel()
+    if user_login_client:
+        try: await user_login_client.disconnect()
+        except Exception: pass
+    user_login_client = None; user_login_qr = None; user_login_task = None
+    await m.reply_text("Userbot login cancelled.")
+
 def main():
     load()
-    if user_app is None:
-        log.warning("USERBOT_SESSION_STRING is not configured. Live Cleaner historical mode is disabled.")
-    else:
-        log.info("Live userbot is configured.")
-    log.info("Starting Cleanfi Telegram clients...")
+    log.info("Starting Cleanfi Telegram client...")
     async def runner():
         await app.start()
-        if user_app is not None:
-            await user_app.start()
-            me = await user_app.get_me()
-            log.info("Live userbot logged in as %s (%s)", me.first_name or "", me.id)
         try:
+            if not await connect_saved_userbot():
+                log.info("No connected Live userbot. Owner can use /userbot.")
             await asyncio.Event().wait()
         finally:
-            if user_app is not None and user_app.is_connected:
-                await user_app.stop()
-            if app.is_connected:
-                await app.stop()
+            if user_login_task and not user_login_task.done(): user_login_task.cancel()
+            if user_app is not None:
+                try: await user_app.disconnect()
+                except Exception: pass
+            if app.is_connected: await app.stop()
     app.run(runner())
 
 if __name__ == "__main__":
