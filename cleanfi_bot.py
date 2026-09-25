@@ -1584,9 +1584,12 @@ async def field_input(_, m):
         if await handle_batch_link_input(m, text):
             return
     if sessions.get((m.from_user.id, "batch_end")):
-        if not re.match(r"^https?://t\.me/(?:c/\d+/|[A-Za-z0-9_]+)/\d+(?:\?.*)?$", text):
+        end_ref = parse_telegram_message_link(text)
+        log.info("BATCH END LINK parsed user=%s ref=%s", m.from_user.id, end_ref)
+        if not end_ref:
             return await m.reply_text("Please send a valid Telegram message link.")
-        await finalize_batch_job(m, sessions[(m.from_user.id, "batch_end")], text)
+        first_link = sessions[(m.from_user.id, "batch_end")]
+        await finalize_batch_job(m, first_link, text)
         return
     userbot_field = sessions.get((m.from_user.id, "userbot_field"))
     if userbot_field:
