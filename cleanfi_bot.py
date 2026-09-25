@@ -788,20 +788,31 @@ async def send_live_link():
     global live_link_timeout_task
     live = live_record()
     pending = live.get("pending_link") or {}
-    mid = pending.get("message_id")
-    if not mid:
+    if not pending.get("message_id"):
         return False
-    msg = await user_app.get_messages(int(live["source"]), int(mid))
-    body = (getattr(msg, "text", "") or getattr(msg, "message", "") or "").strip()
-    if not body:
-        body = "Pocket FM show link"
-    global_cover = (settings.get("global_meta") or {}).get("cover_path")
+
+    # Do not make another Telethon get_messages() call here. The link text is
+    # captured when the link first reaches the worker, so Continue/Skip cannot
+    # get stuck waiting on a source-channel DC.
+    body = (pending.get("text") or "").strip() or "Pocket FM show link"
+
+    # If the owner changed the Live cover before Continue, prefer that new
+    # cover. Otherwise use the DEFAULT GLOBAL cover.
     live_cover = (live.get("meta") or {}).get("cover_path")
-    cover = global_cover if global_cover and Path(global_cover).is_file() else live_cover
+    global_cover = (settings.get("global_meta") or {}).get("cover_path")
+    cover = live_cover if live_cover and Path(live_cover).is_file() else global_cover
+
     if cover and Path(cover).is_file():
-        await tg_call(lambda: app.send_photo(int(live["target"]), photo=str(cover), caption=body), label="live link")
+        await tg_call(
+            lambda: app.send_photo(int(live["target"]), photo=str(cover), caption=body),
+            "__live__", "live link"
+        )
     else:
-        await tg_call(lambda: app.send_message(int(live["target"]), body), label="live link")
+        await tg_call(
+            lambda: app.send_message(int(live["target"]), body),
+            "__live__", "live link"
+        )
+
     live["pending_link"] = None
     live["status"] = "running"
     jobs["__live__"]["status"] = "running"
@@ -874,7 +885,11 @@ async def live_worker():
             if kind == "link":
                 live["status"] = "paused"
                 jobs["__live__"]["status"] = "paused"
-                live["pending_link"] = {"message_id": int(msg.id), "received_at": time.time()}
+                live["pending_link"] = {
+                    "message_id": int(msg.id),
+                    "received_at": time.time(),
+                    "text": (getattr(msg, "text", "") or getattr(msg, "message", "") or "").strip()
+                }
                 await save()
                 await app.send_message(
                     OWNER_ID,
