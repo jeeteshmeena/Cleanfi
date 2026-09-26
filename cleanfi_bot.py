@@ -44,6 +44,7 @@ user_login_code_hash = None
 user_login_prompt_id = None
 user_login_code_timeout = 0
 jobs, settings, sessions, running = {}, {}, {}, {}
+user_profiles = {}
 state_lock = None
 tg_lock = None
 flood_until = 0.0
@@ -65,7 +66,7 @@ live_seen_ids = set()
 
 def save_sync():
     tmp = STATE.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"settings": settings, "jobs": jobs}, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.write_text(json.dumps({"settings": settings, "jobs": jobs, "user_profiles": user_profiles}, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(STATE)
 
 async def save():
@@ -81,6 +82,7 @@ def load():
         data = json.loads(STATE.read_text(encoding="utf-8"))
         settings = data.get("settings", {})
         jobs = data.get("jobs", {})
+        user_profiles = {int(k): v for k, v in data.get("user_profiles", {}).items()}
     except Exception:
         settings, jobs = {}, {}
     settings.setdefault("source", os.getenv("SOURCE_CHAT_ID", ""))
@@ -106,6 +108,7 @@ def load():
     for _k in ("artist", "genre", "year", "album", "album_artist", "comment", "cover_path"):
         gm.setdefault(_k, None)
     for j in jobs.values():
+        j.setdefault("owner", OWNER_ID)
         j.setdefault("source", settings["source"]); j.setdefault("target", settings["target"])
         j.setdefault("processed", []); j.setdefault("failed", []); j.setdefault("skipped", [])
         j.setdefault("failed_reasons", {}); j.setdefault("started_at", None)
@@ -118,6 +121,30 @@ def load():
 
 def allowed(m):
     return bool(m.from_user and m.from_user.id in settings.get("authorized_users", []))
+
+def user_profile(uid):
+    uid = int(uid)
+    p = user_profiles.setdefault(uid, {
+        "source": settings.get("source", ""),
+        "target": settings.get("target", ""),
+        "file_delay": int(settings.get("file_delay", DEFAULT_DELAY_SECONDS)),
+        "global_meta": dict(settings.get("global_meta", {})),
+    })
+    p.setdefault("source", "")
+    p.setdefault("target", "")
+    p.setdefault("file_delay", DEFAULT_DELAY_SECONDS)
+    gm = p.setdefault("global_meta", {})
+    for k in ("artist", "genre", "year", "album", "album_artist", "comment", "cover_path"):
+        gm.setdefault(k, None)
+    return p
+
+def owned_job(uid, jid):
+    j = jobs.get(jid)
+    return bool(j and jid != "__live__" and int(j.get("owner", OWNER_ID)) == int(uid))
+
+def user_job_items(uid):
+    uid = int(uid)
+    return [(jid, j) for jid, j in jobs.items() if jid != "__live__" and int(j.get("owner", OWNER_ID)) == uid]
 
 def is_owner(m):
     return bool(m.from_user and m.from_user.id == OWNER_ID)
@@ -134,7 +161,8 @@ def get_delay(jid):
 
 def getjid(m):
     p = (m.text or "").split()
-    return p[1] if len(p) > 1 and p[1] in jobs else active(m)
+    jid = p[1] if len(p) > 1 and p[1] in jobs else active(m)
+    return jid if jid and owned_job(m.from_user.id, jid) else None
 
 def infer_name(media):
     name = getattr(media, "file_name", None) or ""
@@ -148,8 +176,8 @@ END_POST_TEXT = "Hey, the story is complete. Hope you like it 🫶🏻.\n\nIf yo
 
 GENRE_OPTIONS = ["Drama", "Fantasy", "Suspense & Thriller", "Horror", "Romance", "System", "Romantasy"]
 
-def newmeta():
-    g = settings.get("global_meta", {})
+def newmeta(owner=None):
+    g = user_profile(owner)["global_meta"] if owner is not None else settings.get("global_meta", {})
     return {"title_mode": "original", "artist": g.get("artist"), "genre": g.get("genre"), "year": g.get("year"),
             "album": g.get("album"), "album_artist": g.get("album_artist"), "comment": g.get("comment"), "cover_path": g.get("cover_path")}
 
@@ -247,8 +275,8 @@ def ib(text, data, emoji=None, style=ButtonStyle.PRIMARY):
         kw["icon_custom_emoji_id"] = EMOJI[emoji]
     return InlineKeyboardButton(text, **kw)
 
-def global_meta_kb():
-    g = settings.get("global_meta", {})
+def global_meta_kb(uid=None):
+    g = user_profile(uid)["global_meta"] if uid is not None else settings.get("global_meta", {})
     def v(k):
         x = g.get(k)
         return str(x) if x not in (None, "") else "Not set"
@@ -437,7 +465,8 @@ def summary(jid):
             f"Title: Original source title\nDelay: {get_delay(jid)}s between episodes\n\nProcessed: {len(j['processed'])}/{j['total']} | Failed: {len(j['failed'])} | Skipped: {len(j['skipped'])}")
 
 async def snapshot_job_cover(jid):
-    src = settings.get("global_meta", {}).get("cover_path")
+    owner = jobs[jid].get("owner", OWNER_ID)
+    src = user_profile(owner)["global_meta"].get("cover_path")
     if src and Path(src).is_file():
         dest = TEMP / jid / "cover.jpg"
         dest.parent.mkdir(exist_ok=True)
@@ -448,7 +477,7 @@ async def create_batch_job(owner, first_link, end_link):
     jid = uuid.uuid4().hex[:8]
     jobs[jid] = {"id": jid, "owner": owner, "first_link": first_link, "end_link": end_link, "start": None, "end": None,
                  "total": 0, "processed": [], "failed": [], "failed_reasons": {}, "skipped": [], "status": "configured",
-                 "cancel_requested": False, "meta": newmeta(), "source": settings["source"], "target": settings["target"],
+                 "cancel_requested": False, "meta": newmeta(owner), "source": user_profile(owner)["source"], "target": user_profile(owner)["target"],
                  "created": time.time(), "started_at": None, "progress_message_id": None, "current": None,
                  "flood_until": 0, "queue_ids": None, "delay_seconds": int(settings.get("file_delay", DEFAULT_DELAY_SECONDS)),
                  "start_post": {"image_path": None, "caption": None, "sent": False}, "end_post_sent": False,
@@ -481,7 +510,8 @@ async def handle_batch_link_input(m, text):
 async def finalize_batch_job(m, first_link, end_link):
     uid = m.from_user.id
     sessions.pop((uid, "batch_end"), None)
-    if not settings.get("source") or not settings.get("target"):
+    profile = user_profile(m.from_user.id)
+    if not profile.get("source") or not profile.get("target"):
         return await m.reply_text("Set Global Source and Global Target first.", reply_markup=main_kb())
     try:
         jid = await create_batch_job(uid, first_link, end_link)
@@ -770,14 +800,14 @@ async def cover_cmd(_, m):
 @app.on_message(filters.private & filters.command("jobs"))
 async def jobs_cmd(_, m):
     if allowed(m):
-        rows = [f"{x} — {j['status']} — {len(j['processed'])}/{j['total']}" for x,j in list(jobs.items())[-20:]]
+        rows = [f"{x} — {j['status']} — {len(j['processed'])}/{j['total']}" for x,j in user_job_items(m.from_user.id)[-20:]]
         await m.reply_text("✦ JOBS\n\n" + ("\n".join(rows) or "No jobs."), reply_markup=main_kb())
 
 @app.on_message(filters.private & filters.command("status"))
 async def status_cmd(_, m):
     if not allowed(m): return
     jid = getjid(m)
-    if jid not in jobs: return await m.reply_text("Unknown job.")
+    if not jid or not owned_job(m.from_user.id, jid): return await m.reply_text("Unknown job.")
     await m.reply_text(progress_text(jid) if jobs[jid]["status"] in {"running","cancelling","queued"} else summary(jid), reply_markup=job_kb(jid))
 
 @app.on_message(filters.private & filters.command("failed"))
@@ -793,7 +823,7 @@ async def failed_cmd(_, m):
 async def cancel_cmd(_, m):
     if not allowed(m): return
     jid = getjid(m)
-    if jid not in jobs:
+    if not jid or not owned_job(m.from_user.id, jid):
         return await m.reply_text("Unknown Job ID. Use /cancel JOB_ID or open Jobs.")
     j = jobs[jid]
     if j.get("status") in {"completed", "completed_with_failures", "cancelled", "failed_queue"}:
@@ -828,7 +858,7 @@ async def retry_cmd(_, m):
 async def startjob_cmd(_, m):
     if allowed(m):
         jid = getjid(m)
-        if jid in jobs: await launch(jid, m)
+        if jid and owned_job(m.from_user.id, jid): await launch(jid, m)
 
 @app.on_message(filters.private & filters.command("test"))
 async def test_cmd(_, m):
@@ -1258,17 +1288,18 @@ async def callback_handler(_, q: CallbackQuery):
                 )
 
             field, value = pending
+            profile = user_profile(q.from_user.id)
             if field == "cover_path":
-                settings.setdefault("global_meta", {})["cover_path"] = value
+                profile.setdefault("global_meta", {})["cover_path"] = value
             elif field == "delay":
-                settings["file_delay"] = min(MAX_DELAY_SECONDS, max(MIN_DELAY_SECONDS, int(value)))
+                profile["file_delay"] = min(MAX_DELAY_SECONDS, max(MIN_DELAY_SECONDS, int(value)))
             elif field in {"source", "target"}:
-                settings[field] = str(value)
-                for job in jobs.values():
+                profile[field] = str(value)
+                for _, job in user_job_items(q.from_user.id):
                     if job.get("status") in {"configured", "paused"}:
                         job[field] = str(value)
             else:
-                settings.setdefault("global_meta", {})[field] = value
+                profile.setdefault("global_meta", {})[field] = value
             sessions.pop(key, None)
             await save()
             await q.answer("Saved")
@@ -1357,7 +1388,7 @@ async def callback_handler(_, q: CallbackQuery):
 
         if data == "m:metadata":
             await q.answer()
-            return await q.message.reply_text("Global Metadata", reply_markup=global_meta_kb())
+            return await q.message.reply_text("Global Metadata", reply_markup=global_meta_kb(q.from_user.id))
 
         if data in {"m:source", "m:target", "m:delay"}:
             field = data.split(":")[1]
@@ -1408,13 +1439,13 @@ async def callback_handler(_, q: CallbackQuery):
 
         if data == "m:status":
             await q.answer()
-            rows = [f"{x} — {j['status']} — {len(j['processed'])}/{j['total']}" for x,j in list(jobs.items())[-10:]]
+            rows = [f"{x} — {j['status']} — {len(j['processed'])}/{j['total']}" for x,j in user_job_items(q.from_user.id)[-10:]]
             return await q.message.reply_text("STATUS\n\n" + ("\n".join(rows) or "No jobs."), reply_markup=main_kb())
 
         if data == "m:failed":
             await q.answer()
             rows = []
-            for x,j in jobs.items():
+            for x,j in user_job_items(q.from_user.id):
                 if j.get("failed"):
                     rows.append(f"{x} — {len(j['failed'])} failed")
             return await q.message.reply_text("FAILED\n\n" + ("\n".join(rows) or "No failed files."), reply_markup=main_kb())
@@ -1525,8 +1556,8 @@ async def callback_handler(_, q: CallbackQuery):
 
         if data.startswith("s:") or data.startswith("genre:") or data.startswith("genreopt:") or data.startswith("genrecustom:") or data.startswith("genrecancel:") or data.startswith("cover:") or data.startswith("clear:") or data.startswith("startpost:") or data.startswith("start:") or data.startswith("cancel:") or data.startswith("refresh:"):
             jid = p[-1]
-            if jid not in jobs:
-                return await q.answer("Unknown job", show_alert=True)
+            if not owned_job(q.from_user.id, jid):
+                return await q.answer("This job belongs to another user.", show_alert=True)
             if data.startswith("s:"):
                 field = p[1]
                 sessions[q.from_user.id] = jid
