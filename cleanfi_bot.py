@@ -200,6 +200,17 @@ async def tg_call(fn, jid=None, label="Telegram"):
                 seconds = max(1, int(e.value))
                 flood_until = time.time() + seconds
                 if jid and jobs.get(jid):
+                    last = jobs[jid].get("last_flood_notice", 0)
+                    if time.time() - last > 30:
+                        jobs[jid]["last_flood_notice"] = time.time()
+                        try:
+                            asyncio.create_task(app.send_message(
+                                jobs[jid].get("owner", OWNER_ID),
+                                f"Job {jid} is waiting because Telegram returned FloodWait.\\nOperation: {label}\\nWait time: {seconds}s\\nCleanfi will automatically retry the same operation."
+                            ))
+                        except Exception:
+                            log.exception("FLOODWAIT NOTIFICATION FAILED job=%s", jid)
+                if jid and jobs.get(jid):
                     jobs[jid]["flood_until"] = flood_until
                     jobs[jid]["flood_label"] = label
                     await save()
@@ -244,7 +255,8 @@ def progress_text(jid):
     eta = ((total-done) / speed * 60) if speed else 0
     current = j.get("current")
     cur = f"\nCurrent: #{current}" if current else ""
-    return (f"Cleanfi Processing\nJob: {jid}{cur}\n\n{bar} {pct}%\n"
+    stage = j.get("stage") or "Idle"
+    return (f"Cleanfi Processing\nJob: {jid}{cur}\nStage: {stage}\n\n{bar} {pct}%\n"
             f"Files: {done} / {total}\nProcessed: {len(j['processed'])}\n"
             f"Failed: {len(j['failed'])}\nSkipped: {len(j['skipped'])}\n"
             f"Speed: {speed:.1f} files/min\nElapsed: {int(elapsed//60)}m {int(elapsed%60)}s\n"
@@ -347,7 +359,8 @@ def job_kb(jid):
         [ib(f"Start Post: {'Set' if jobs[jid].get('start_post', {}).get('image_path') else 'Not set'}", f"startpost:{jid}", "cover", ButtonStyle.PRIMARY),
          ib(f"Cover: {'Attached' if m.get('cover_path') else 'Not set'}", f"cover:{jid}", "cover", ButtonStyle.PRIMARY)],
         [ib("Clear Cover", f"clear:{jid}", "cancel", ButtonStyle.DANGER)],
-        [ib("START", f"start:{jid}", "start", ButtonStyle.SUCCESS),
+        [ib("START / RESUME", f"start:{jid}", "start", ButtonStyle.SUCCESS),
+         ib("PAUSE", f"pause:{jid}", "delay", ButtonStyle.PRIMARY),
          ib("CANCEL JOB", f"cancel:{jid}", "cancel", ButtonStyle.DANGER)],
         [ib("Refresh", f"refresh:{jid}", "status", ButtonStyle.PRIMARY)],
     ])
@@ -406,6 +419,14 @@ async def launch(jid, m, ids=None):
     await safe_progress(jid, force=True)
 
     for mid in list(ids):
+        if j.get("cancel_requested"):
+            j["status"] = "cancelled"
+            break
+        while j.get("status") == "paused" and not j.get("cancel_requested"):
+            j["stage"] = "Paused"
+            await save()
+            await safe_progress(jid, force=True)
+            await asyncio.sleep(1)
         if j.get("cancel_requested"):
             j["status"] = "cancelled"
             break
@@ -860,6 +881,52 @@ async def startjob_cmd(_, m):
         jid = getjid(m)
         if jid and owned_job(m.from_user.id, jid): await launch(jid, m)
 
+@app.on_message(filters.private & filters.command("pause"))
+async def pause_cmd(_, m):
+    if not allowed(m): return
+    jid = getjid(m)
+    if not jid or not owned_job(m.from_user.id, jid):
+        return await m.reply_text("Unknown job.")
+    j = jobs[jid]
+    if j.get("status") == "running":
+        j["status"] = "paused"
+        j["stage"] = "Paused"
+        await save()
+        await safe_progress(jid, force=True)
+        return await m.reply_text(f"Job {jid} paused.", reply_markup=job_kb(jid))
+    if j.get("status") == "queued":
+        queued_jobs.discard(jid)
+        if jid in queue_order:
+            queue_order.remove(jid)
+        j["status"] = "paused"
+        j["stage"] = "Paused in queue"
+        await save()
+        return await m.reply_text(f"Queued job {jid} paused.", reply_markup=job_kb(jid))
+    return await m.reply_text(f"Job {jid} is {j.get('status')}.", reply_markup=job_kb(jid))
+
+@app.on_message(filters.private & filters.command("resume"))
+async def resume_cmd(_, m):
+    if not allowed(m): return
+    jid = getjid(m)
+    if not jid or not owned_job(m.from_user.id, jid):
+        return await m.reply_text("Unknown job.")
+    if jobs[jid].get("status") == "paused":
+        if normal_active_jid and normal_active_jid != jid and jobs.get(normal_active_jid, {}).get("status") in {"running","paused","cancelling"}:
+            if jid not in queued_jobs:
+                queued_jobs.add(jid)
+                queue_order.append(jid)
+            jobs[jid]["status"] = "queued"
+            jobs[jid]["stage"] = "Queued"
+            await save()
+            return await m.reply_text(f"Job {jid} resumed into the queue.", reply_markup=job_kb(jid))
+        jobs[jid]["status"] = "running"
+        jobs[jid]["cancel_requested"] = False
+        await save()
+        return await m.reply_text(f"Job {jid} resumed.", reply_markup=job_kb(jid))
+    if jobs[jid].get("status") == "queued":
+        return await m.reply_text(f"Job {jid} is already queued.", reply_markup=job_kb(jid))
+    return await m.reply_text(f"Job {jid} is {jobs[jid].get('status')}.", reply_markup=job_kb(jid))
+
 @app.on_message(filters.private & filters.command("test"))
 async def test_cmd(_, m):
     if not allowed(m): return
@@ -907,6 +974,8 @@ async def process_file(jid, mid, message=None, meta_override=None, source_client
     if MIN_FREE_DISK_GB and __import__("shutil").disk_usage(TEMP).free < MIN_FREE_DISK_GB * 1024**3:
         return "failed", f"Low disk space: less than {MIN_FREE_DISK_GB} GB free"
     source_client = source_client or app
+    j["stage"] = "Fetching source message"
+    await save()
     msg = message or await tg_call(lambda: source_client.get_messages(int(j["source"]), mid), jid, "get_messages")
     if isinstance(source_client, TelegramClient):
         media = getattr(msg, "audio", None) or (msg.document if getattr(msg, "document", None) and str(getattr(msg.document, "mime_type", "") or "").startswith("audio/") else None)
@@ -924,6 +993,8 @@ async def process_file(jid, mid, message=None, meta_override=None, source_client
     d = TEMP / jid; d.mkdir(exist_ok=True)
     inp = d / f"{mid}_{Path(name).name}"; out = d / f"out_{mid}_{Path(name).name}"
     try:
+        j["stage"] = "Downloading"
+        await save()
         await download_media_direct(media, str(inp), jid, client=source_client, message=msg)
         title = read_original_title(str(inp))
         if title is None:
@@ -931,6 +1002,8 @@ async def process_file(jid, mid, message=None, meta_override=None, source_client
                 f = MFile(str(inp), easy=True); title = (f.get("title") or [None])[0] if f else None
             except Exception: title = None
         title = title if title is not None else Path(name).stem
+        j["stage"] = "Cleaning metadata"
+        await save()
         await asyncio.to_thread(clean_and_apply_metadata, str(inp), str(out), title=title,
             artist=meta.get("artist"), genre=meta.get("genre"), year=meta.get("year"),
             cover=meta.get("cover_path"), album=meta.get("album"),
@@ -940,6 +1013,8 @@ async def process_file(jid, mid, message=None, meta_override=None, source_client
         if meta.get("artist"): kw["performer"] = str(meta["artist"])
         cp = meta.get("cover_path")
         if cp and Path(cp).is_file(): kw["thumb"] = cp
+        j["stage"] = "Uploading"
+        await save()
         if jid == "__live__":
             await live_send_audio(j["target"], **kw)
         else:
@@ -1630,9 +1705,32 @@ async def callback_handler(_, q: CallbackQuery):
                 await save()
                 await q.answer("Cover cleared")
                 return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
+            if data.startswith("pause:"):
+                j = jobs[jid]
+                if j.get("status") == "running":
+                    j["status"] = "paused"
+                    j["stage"] = "Paused"
+                    await save()
+                    await safe_progress(jid, force=True)
+                    return await q.answer("Job paused.")
+                if j.get("status") == "queued":
+                    queued_jobs.discard(jid)
+                    if jid in queue_order:
+                        queue_order.remove(jid)
+                    j["status"] = "paused"
+                    j["stage"] = "Paused in queue"
+                    await save()
+                    return await q.answer("Queued job paused.")
+                return await q.answer(f"Cannot pause: {j.get('status')}.")
+
             if data.startswith("start:"):
-                await q.answer("Starting...")
+                await q.answer("Starting / resuming...")
                 try:
+                    if jobs[jid].get("status") == "paused":
+                        jobs[jid]["status"] = "running"
+                        jobs[jid]["cancel_requested"] = False
+                        await save()
+                        return await q.message.edit_text(progress_text(jid), reply_markup=job_kb(jid))
                     return await launch(jid, q.message)
                 except Exception as e:
                     return await q.message.reply_text(f"Could not start job: {type(e).__name__}: {e}", reply_markup=job_kb(jid))
