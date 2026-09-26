@@ -66,7 +66,14 @@ live_seen_ids = set()
 
 def save_sync():
     tmp = STATE.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"settings": settings, "jobs": jobs, "user_profiles": user_profiles}, ensure_ascii=False, indent=2), encoding="utf-8")
+    persisted_settings = dict(settings)
+    persisted_settings["_normal_queue_order"] = list(queue_order)
+    persisted_settings["_normal_active_jid"] = normal_active_jid
+    tmp.write_text(
+        json.dumps({"settings": persisted_settings, "jobs": jobs, "user_profiles": user_profiles},
+                   ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
     tmp.replace(STATE)
 
 async def save():
@@ -77,14 +84,18 @@ async def save():
         await asyncio.to_thread(save_sync)
 
 def load():
-    global jobs, settings
+    global jobs, settings, user_profiles, queue_order, queued_jobs, normal_active_jid
+    persisted_queue = []
+    persisted_active = None
     try:
         data = json.loads(STATE.read_text(encoding="utf-8"))
         settings = data.get("settings", {})
+        persisted_queue = list(settings.pop("_normal_queue_order", []) or [])
+        persisted_active = settings.pop("_normal_active_jid", None)
         jobs = data.get("jobs", {})
         user_profiles = {int(k): v for k, v in data.get("user_profiles", {}).items()}
     except Exception:
-        settings, jobs = {}, {}
+        settings, jobs, user_profiles = {}, {}, {}
     settings.setdefault("source", os.getenv("SOURCE_CHAT_ID", ""))
     settings.setdefault("authorized_users", [OWNER_ID])
     settings["authorized_users"] = sorted({OWNER_ID} | {int(x) for x in settings.get("authorized_users", [])})
@@ -107,17 +118,34 @@ def load():
     gm = settings.setdefault("global_meta", {})
     for _k in ("artist", "genre", "year", "album", "album_artist", "comment", "cover_path"):
         gm.setdefault(_k, None)
-    for j in jobs.values():
+    restarted_active = None
+    for jid, j in jobs.items():
         j.setdefault("owner", OWNER_ID)
         j.setdefault("source", settings["source"]); j.setdefault("target", settings["target"])
         j.setdefault("processed", []); j.setdefault("failed", []); j.setdefault("skipped", [])
         j.setdefault("failed_reasons", {}); j.setdefault("started_at", None)
         j.setdefault("progress_message_id", None); j.setdefault("last_progress", 0)
         j.setdefault("current", None); j.setdefault("flood_until", 0)
-        if j.get("status") in {"running", "queued", "cancelling"}:
-            j["status"] = "paused"
         j.setdefault("retries", 0)
         j.setdefault("stats", {"files_sent": len(j.get("processed", [])), "bytes_downloaded": 0, "bytes_uploaded": 0, "started_at": j.get("started_at"), "finished_at": None})
+        if jid != "__live__" and j.get("status") in {"running", "cancelling"}:
+            j["status"] = "paused"
+            j["stage"] = "Paused after bot restart — press START / RESUME"
+            j["cancel_requested"] = False
+            restarted_active = jid
+
+    valid_queue = []
+    for jid in persisted_queue:
+        if jid in jobs and jid != "__live__" and jobs[jid].get("status") == "queued" and jid not in valid_queue:
+            valid_queue.append(jid)
+    for jid, j in sorted(jobs.items(), key=lambda item: item[1].get("created", 0)):
+        if jid != "__live__" and j.get("status") == "queued" and jid not in valid_queue:
+            valid_queue.append(jid)
+    queue_order = valid_queue
+    queued_jobs = set(valid_queue)
+    normal_active_jid = restarted_active if restarted_active in jobs else None
+    if normal_active_jid is None and persisted_active in jobs and jobs[persisted_active].get("status") == "paused":
+        normal_active_jid = persisted_active
 
 def allowed(m):
     return bool(m.from_user and m.from_user.id in settings.get("authorized_users", []))
@@ -365,6 +393,34 @@ def job_kb(jid):
         [ib("Refresh", f"refresh:{jid}", "status", ButtonStyle.PRIMARY)],
     ])
 
+def _job_task_done(jid, task):
+    job_tasks.pop(jid, None)
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        exc = e
+    if exc is not None:
+        j = jobs.get(jid)
+        if j and j.get("status") in {"running", "cancelling"}:
+            j["status"] = "paused"
+            j["stage"] = f"Paused after worker error: {type(exc).__name__}: {exc}"
+            j["cancel_requested"] = False
+            asyncio.create_task(save())
+            log.error("JOB WORKER DIED job=%s error=%s", jid, exc)
+
+
+def start_job_task(jid, message):
+    existing = job_tasks.get(jid)
+    if existing and not existing.done():
+        return existing
+    task = asyncio.create_task(launch(jid, message), name=f"cleanfi-job-{jid}")
+    job_tasks[jid] = task
+    task.add_done_callback(lambda t, _jid=jid: _job_task_done(_jid, t))
+    return task
+
+
 async def launch(jid, m, ids=None):
     global normal_active_jid
 
@@ -385,6 +441,7 @@ async def launch(jid, m, ids=None):
             queued_jobs.add(jid)
             queue_order.append(jid)
         j["status"] = "queued"
+        j["stage"] = "Waiting in FIFO queue"
         j["cancel_requested"] = False
         await save()
         position = queue_order.index(jid) + 1 if jid in queue_order else len(queue_order)
@@ -403,6 +460,7 @@ async def launch(jid, m, ids=None):
         queue_order.remove(jid)
     normal_active_jid = jid
     j["status"] = "running"
+    j["stage"] = "Starting / resuming"
     j["cancel_requested"] = False
     j["started_at"] = j.get("started_at") or time.time()
     j.setdefault("stats", {})["started_at"] = j["started_at"]
@@ -473,7 +531,7 @@ async def launch(jid, m, ids=None):
         queued_jobs.discard(next_jid)
         if next_jid in jobs and jobs[next_jid].get("status") == "queued":
             log.info("QUEUE START next_job=%s after_job=%s", next_jid, jid)
-            asyncio.create_task(launch(next_jid, m, jobs[next_jid].get("queue_ids")))
+            start_job_task(next_jid, m)
     return await m.reply_text(summary(jid), reply_markup=job_kb(jid))
 
 def summary(jid):
@@ -1545,7 +1603,36 @@ async def callback_handler(_, q: CallbackQuery):
         if data == "m:jobs":
             await q.answer()
             rows = [f"{x} — {j['status']} — {len(j['processed'])}/{j['total']}" for x,j in list(jobs.items())[-20:]]
-            return await q.message.reply_text("JOBS\n\n" + ("\n".join(rows) or "No jobs."), reply_markup=main_kb())
+            kb = InlineKeyboardMarkup([
+                [ib("RESUME QUEUE", "jobs:resume", "start", ButtonStyle.SUCCESS)],
+                [ib("Back", "live:back", "cancel", ButtonStyle.DANGER)]
+            ])
+            return await q.message.reply_text(
+                "JOBS\n\n" + ("\n".join(rows) or "No jobs.") +
+                "\n\nPress RESUME QUEUE after a restart to continue the saved FIFO queue.",
+                reply_markup=kb
+            )
+
+        if data == "jobs:resume":
+            candidates = []
+            if normal_active_jid and normal_active_jid in jobs and jobs[normal_active_jid].get("status") == "paused":
+                candidates.append(normal_active_jid)
+            for queued_jid in queue_order:
+                if queued_jid in jobs and jobs[queued_jid].get("status") in {"queued", "paused"}:
+                    candidates.append(queued_jid)
+            if not candidates:
+                candidates = [
+                    jid for jid, j in sorted(jobs.items(), key=lambda item: item[1].get("created", 0))
+                    if jid != "__live__" and j.get("status") == "paused"
+                ]
+            if not candidates:
+                return await q.answer("No paused/queued jobs to resume.", show_alert=True)
+            first = candidates[0]
+            jobs[first]["cancel_requested"] = False
+            await save()
+            start_job_task(first, q.message)
+            await q.answer(f"Resuming {first}. Saved queue will continue automatically.")
+            return await q.message.reply_text(progress_text(first), reply_markup=job_kb(first))
 
         if data == "m:stats":
             await q.answer()
@@ -1726,17 +1813,30 @@ async def callback_handler(_, q: CallbackQuery):
             if data.startswith("start:"):
                 await q.answer("Starting / resuming...")
                 try:
-                    if jobs[jid].get("status") == "paused":
-                        jobs[jid]["status"] = "running"
+                    status = jobs[jid].get("status")
+                    if status == "paused":
                         jobs[jid]["cancel_requested"] = False
-                        await save()
-                        return await q.message.edit_text(progress_text(jid), reply_markup=job_kb(jid))
-                    return await launch(jid, q.message)
+                        jobs[jid]["stage"] = "Resuming"
+                    elif status == "queued":
+                        jobs[jid]["cancel_requested"] = False
+                    start_job_task(jid, q.message)
+                    await asyncio.sleep(0)
+                    return await q.message.edit_text(progress_text(jid), reply_markup=job_kb(jid))
                 except Exception as e:
+                    log.exception("JOB START/RESUME FAILED job=%s", jid)
                     return await q.message.reply_text(f"Could not start job: {type(e).__name__}: {e}", reply_markup=job_kb(jid))
             if data.startswith("cancel:"):
-                jobs[jid]["cancel_requested"] = True
-                jobs[jid]["status"] = "cancelling"
+                j = jobs[jid]
+                if j.get("status") == "queued":
+                    queued_jobs.discard(jid)
+                    if jid in queue_order:
+                        queue_order.remove(jid)
+                    j["status"] = "cancelled"
+                    j["stage"] = "Cancelled while queued"
+                elif j.get("status") in {"running", "paused", "cancelling"}:
+                    j["cancel_requested"] = True
+                    j["status"] = "cancelling"
+                    j["stage"] = "Cancelling"
                 await save()
                 return await q.answer("Cancellation requested")
             if data.startswith("refresh:"):
@@ -2126,6 +2226,12 @@ async def userbot_cancel_cmd(_, m):
 
 def main():
     load()
+    log.info(
+        "Recovered normal jobs: active=%s queued=%s paused=%s",
+        normal_active_jid,
+        queue_order,
+        [jid for jid, j in jobs.items() if jid != "__live__" and j.get("status") == "paused"]
+    )
     log.info("Starting Cleanfi Telegram client...")
     async def runner():
         await app.start()
