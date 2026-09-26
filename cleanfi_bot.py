@@ -980,6 +980,7 @@ def live_record():
     live.setdefault("backlog_loaded", False)
     live.setdefault("loading_backlog", False)
     live.setdefault("ingest_buffer", [])
+    live.setdefault("auto_mode", False)
     return live
 
 async def send_live_link():
@@ -1061,7 +1062,7 @@ def live_kb():
                 [ib("Resume", "live:start", "start", ButtonStyle.SUCCESS), ib("Stop", "live:stop", "cancel", ButtonStyle.DANGER)]
                 if status == "paused" else
                 [ib("START", "live:start", "start", ButtonStyle.SUCCESS)])
-    return InlineKeyboardMarkup([controls, [ib("Live Source", "live:source", "source"), ib("Live Target", "live:target", "target")], [ib(f"Start ID: {live_record().get('start_id') or 'Not set'}", "live:startid", "status")], [ib("Live Metadata", "live:meta", "genre")], [ib("Refresh", "live:refresh", "status")], [ib("Back", "live:back", "cancel", ButtonStyle.DANGER)]])
+    return InlineKeyboardMarkup([controls, [ib("Live Source", "live:source", "source"), ib("Live Target", "live:target", "target")], [ib(f"Start ID: {live_record().get('start_id') or 'Not set'}", "live:startid", "status")], [ib(f"Auto Mode: {'ON' if live_record().get('auto_mode') else 'OFF'}", "live:auto", "start")], [ib("Live Metadata", "live:meta", "genre")], [ib("Reset Live Cleaner", "live:reset", "cancel", ButtonStyle.DANGER)], [ib("Refresh", "live:refresh", "status")], [ib("Back", "live:back", "cancel", ButtonStyle.DANGER)]])
 
 def live_text():
     live = live_record(); s = live.get("stats", {})
@@ -1095,6 +1096,14 @@ async def live_worker():
                     "text": (getattr(msg, "text", "") or getattr(msg, "message", "") or "").strip()
                 }
                 await save()
+                if live.get("auto_mode"):
+                    log.info("LIVE AUTO MODE: sending link without confirmation message=%s", msg.id)
+                    try:
+                        await send_live_link()
+                    except Exception:
+                        log.exception("LIVE AUTO LINK SEND FAILED message=%s", msg.id)
+                    continue
+
                 await app.send_message(
                     OWNER_ID,
                     "Pocket FM show link reached.\n\n"
@@ -1193,6 +1202,32 @@ async def start_live():
     jobs["__live__"]["status"] = "running"
     await save()
     log.info("LIVE BACKLOG LOADED source=%s start_id=%s messages=%s", live["source"], start_id, len(ordered))
+
+async def reset_live():
+    global live_task, live_queue, live_link_timeout_task, live_seen_ids
+    live = live_record()
+    if live_task and not live_task.done():
+        live_task.cancel()
+    if live_link_timeout_task and not live_link_timeout_task.done():
+        live_link_timeout_task.cancel()
+    live_task = None
+    live_link_timeout_task = None
+    live_queue = None
+    live_seen_ids = set()
+    live.clear()
+    live.update({
+        "status": "stopped", "source": "", "target": "", "start_id": 0,
+        "meta": newmeta(), "stats": {"files_sent": 0, "bytes_downloaded": 0, "bytes_uploaded": 0},
+        "pending_link": None, "queued": 0, "current": None,
+        "backlog_loaded": False, "loading_backlog": False, "ingest_buffer": [],
+        "auto_mode": False
+    })
+    jobs["__live__"] = {"id":"__live__","owner":OWNER_ID,"source":"","target":"","start":0,"end":0,
+        "start_id":0,"total":0,"processed":[],"failed":[],"skipped":[],"failed_reasons":{},
+        "status":"stopped","cancel_requested":False,"meta":live["meta"],
+        "delay_seconds":int(settings.get("file_delay", DEFAULT_DELAY_SECONDS)),
+        "stats":live["stats"],"current":None}
+    await save()
 
 async def pause_live():
     live_record()["status"] = "paused"
@@ -1497,6 +1532,18 @@ async def callback_handler(_, q: CallbackQuery):
         if data == "live:back":
             await q.answer()
             return await q.message.reply_text("CLEANFI", reply_markup=main_kb())
+
+        if data == "live:auto":
+            live = live_record()
+            live["auto_mode"] = not bool(live.get("auto_mode"))
+            await save()
+            await q.answer(f"Auto Mode {'ON' if live['auto_mode'] else 'OFF'}")
+            return await q.message.edit_text(live_text(), reply_markup=live_kb())
+
+        if data == "live:reset":
+            await reset_live()
+            await q.answer("Live Cleaner reset.")
+            return await q.message.reply_text("Live Cleaner has been completely reset.", reply_markup=live_kb())
 
         if data == "live:start":
             await q.answer("Starting Live Cleaner...")
