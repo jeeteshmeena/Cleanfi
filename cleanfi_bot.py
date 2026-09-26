@@ -1136,6 +1136,11 @@ async def live_worker():
 async def start_live():
     global live_queue, live_task, live_seen_ids
     live = live_record()
+    # Keep one stable queue object for the entire start/backlog operation.
+    # stop/start races must never leave a running backlog with live_queue=None.
+    if live_queue is None:
+        live_queue = asyncio.Queue()
+    queue = live_queue
     if not live.get("source") or not live.get("target"):
         raise ValueError("Set Live Source and Live Target first.")
     start_id = int(live.get("start_id") or 0)
@@ -1156,8 +1161,6 @@ async def start_live():
     live["ingest_buffer"] = []
     live["backlog_loaded"] = False
     jobs["__live__"]["status"] = "starting"
-    if live_queue is None:
-        live_queue = asyncio.Queue()
     if live_task is None or live_task.done():
         live_task = asyncio.create_task(live_worker())
 
@@ -1180,10 +1183,10 @@ async def start_live():
         media = msg.audio or (msg.document if msg.document and (getattr(msg.document, "mime_type", "") or "").startswith("audio/") else None)
         if is_link:
             live["queued"] = live.get("queued", 0) + 1
-            await live_queue.put(("link", msg, user_app))
+            await queue.put(("link", msg, user_app))
         elif media:
             live["queued"] = live.get("queued", 0) + 1
-            await live_queue.put(("audio", msg, user_app))
+            await queue.put(("audio", msg, user_app))
     live["loading_backlog"] = False
     live["backlog_loaded"] = True
     live["status"] = "running"
@@ -1208,8 +1211,14 @@ async def stop_live():
 async def ingest_live_message(m, source_client):
     global live_seen_ids
     live = live_record()
-    if live.get("status") not in {"starting", "running", "paused"} or live_queue is None:
+    if live.get("status") not in {"starting", "running", "paused"}:
         return
+    queue = live_queue
+    if queue is None:
+        # A stop/start race may have cleared the global reference. Recreate it
+        # instead of failing with "'NoneType' object has no attribute 'put'".
+        live_queue = asyncio.Queue()
+        queue = live_queue
     try:
         if int(getattr(m.chat, "id", getattr(m, "chat_id", 0))) != int(live.get("source")) or int(m.id) < int(live.get("start_id") or 0):
             return
@@ -1227,13 +1236,13 @@ async def ingest_live_message(m, source_client):
         return
     if is_link:
         live["queued"] = live.get("queued", 0) + 1
-        await live_queue.put(("link", m, source_client))
+        await queue.put(("link", m, source_client))
         log.info("LIVE LINK QUEUED source=%s message=%s queue=%s", m.chat.id, m.id, live["queued"])
         return
     if not media:
         return
     live["queued"] = live.get("queued", 0) + 1
-    await live_queue.put(("audio", m, source_client))
+    await queue.put(("audio", m, source_client))
     log.info("LIVE AUDIO QUEUED source=%s message=%s queue=%s", m.chat.id, m.id, live["queued"])
 
 @app.on_message(filters.channel, group=-50)
