@@ -421,12 +421,18 @@ def start_job_task(jid, message):
     return task
 
 
-async def launch(jid, m, ids=None):
+async def _launch_job(jid, m, ids=None):
     global normal_active_jid
 
     if jid not in jobs:
         raise ValueError("Unknown Job ID.")
     j = jobs[jid]
+    log.info(
+        "JOB LAUNCH jid=%s status=%s range=%s-%s source=%s target=%s processed=%s/%s",
+        jid, j.get("status"), j.get("start"), j.get("end"),
+        j.get("source"), j.get("target"),
+        len(j.get("processed", [])), j.get("total", 0)
+    )
 
     if j.get("status") == "running":
         return await m.reply_text("Job is already running.", reply_markup=job_kb(jid))
@@ -491,6 +497,12 @@ async def launch(jid, m, ids=None):
         if mid in j.get("processed", []) or mid in j.get("skipped", []) or mid in j.get("failed", []):
             continue
         j["current"] = mid
+        log.info(
+            "JOB FILE START jid=%s message=%s progress=%s/%s",
+            jid, mid,
+            len(j.get("processed", [])) + len(j.get("failed", [])) + len(j.get("skipped", [])),
+            j.get("total", 0)
+        )
         try:
             result, reason = await process_file_with_retry(jid, int(mid))
             if result == "ok":
@@ -504,6 +516,13 @@ async def launch(jid, m, ids=None):
             j["failed"].append(int(mid))
             j["failed_reasons"][str(mid)] = f"{type(e).__name__}: {e}"
             log.exception("JOB %s failed for message %s", jid, mid)
+        log.info(
+            "JOB FILE DONE jid=%s message=%s result=%s processed=%s failed=%s skipped=%s",
+            jid, mid, result,
+            len(j.get("processed", [])),
+            len(j.get("failed", [])),
+            len(j.get("skipped", [])),
+        )
         j["current"] = None
         await save()
         await safe_progress(jid)
@@ -533,6 +552,48 @@ async def launch(jid, m, ids=None):
             log.info("QUEUE START next_job=%s after_job=%s", next_jid, jid)
             start_job_task(next_jid, m)
     return await m.reply_text(summary(jid), reply_markup=job_kb(jid))
+
+async def launch(jid, m, ids=None):
+    """Supervised normal-job worker.
+
+    Any unexpected worker exception is converted into a durable paused state,
+    recorded in the job stage, logged with traceback, and reported to the owner.
+    This prevents a resumed job from silently stopping.
+    """
+    try:
+        log.info(
+            "JOB WORKER START jid=%s status=%s processed=%s/%s current=%s",
+            jid,
+            jobs.get(jid, {}).get("status"),
+            len(jobs.get(jid, {}).get("processed", [])),
+            jobs.get(jid, {}).get("total", 0),
+            jobs.get(jid, {}).get("current"),
+        )
+        return await _launch_job(jid, m, ids)
+    except asyncio.CancelledError:
+        log.warning("JOB WORKER CANCELLED jid=%s", jid)
+        raise
+    except Exception as e:
+        j = jobs.get(jid)
+        if j:
+            j["status"] = "paused"
+            j["stage"] = f"Paused after worker error: {type(e).__name__}: {e}"
+            j["cancel_requested"] = False
+            j["current"] = None
+            await save()
+            log.exception("JOB WORKER CRASHED jid=%s", jid)
+            try:
+                await app.send_message(
+                    j.get("owner", OWNER_ID),
+                    f"Job {jid} stopped unexpectedly.\\n\\n"
+                    f"Stage: {j.get('stage')}\\n"
+                    f"Processed: {len(j.get('processed', []))}/{j.get('total', 0)}\\n"
+                    f"Current: {j.get('current') or 'None'}\\n\\n"
+                    "The job is preserved as PAUSED. Press START / RESUME to continue after fixing the issue."
+                )
+            except Exception:
+                log.exception("JOB ERROR NOTIFICATION FAILED jid=%s", jid)
+        return None
 
 def summary(jid):
     j = jobs[jid]; m = j["meta"]
@@ -1776,7 +1837,7 @@ async def callback_handler(_, q: CallbackQuery):
             await q.answer()
             return await q.message.reply_text(f"Send global {field.replace('_', ' ')}.")
 
-        if data.startswith("s:") or data.startswith("genre:") or data.startswith("genreopt:") or data.startswith("genrecustom:") or data.startswith("genrecancel:") or data.startswith("cover:") or data.startswith("clear:") or data.startswith("startpost:") or data.startswith("start:") or data.startswith("cancel:") or data.startswith("refresh:"):
+        if data.startswith("s:") or data.startswith("genre:") or data.startswith("genreopt:") or data.startswith("genrecustom:") or data.startswith("genrecancel:") or data.startswith("cover:") or data.startswith("clear:") or data.startswith("startpost:") or data.startswith("start:") or data.startswith("pause:") or data.startswith("cancel:") or data.startswith("refresh:"):
             jid = p[-1]
             if not owned_job(q.from_user.id, jid):
                 return await q.answer("This job belongs to another user.", show_alert=True)
@@ -1798,6 +1859,7 @@ async def callback_handler(_, q: CallbackQuery):
                 return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
             if data.startswith("pause:"):
                 j = jobs[jid]
+                log.info("JOB PAUSE REQUEST jid=%s status=%s", jid, j.get("status"))
                 if j.get("status") == "running":
                     j["status"] = "paused"
                     j["stage"] = "Paused"
@@ -1816,6 +1878,7 @@ async def callback_handler(_, q: CallbackQuery):
 
             if data.startswith("start:"):
                 await q.answer("Starting / resuming...")
+                log.info("JOB RESUME REQUEST jid=%s status=%s task=%s", jid, jobs[jid].get("status"), bool(job_tasks.get(jid) and not job_tasks[jid].done()))
                 try:
                     status = jobs[jid].get("status")
                     if status == "paused":
