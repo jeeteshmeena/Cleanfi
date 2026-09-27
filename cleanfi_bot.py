@@ -1604,34 +1604,79 @@ async def callback_handler(_, q: CallbackQuery):
             await q.answer()
             rows = [f"{x} — {j['status']} — {len(j['processed'])}/{j['total']}" for x,j in list(jobs.items())[-20:]]
             kb = InlineKeyboardMarkup([
-                [ib("RESUME QUEUE", "jobs:resume", "start", ButtonStyle.SUCCESS)],
+                [ib("RESUME ALL PAUSED / QUEUED", "jobs:resume", "start", ButtonStyle.SUCCESS)],
                 [ib("Back", "live:back", "cancel", ButtonStyle.DANGER)]
             ])
             return await q.message.reply_text(
                 "JOBS\n\n" + ("\n".join(rows) or "No jobs.") +
-                "\n\nPress RESUME QUEUE after a restart to continue the saved FIFO queue.",
+                "\n\nPress RESUME ALL PAUSED / QUEUED to activate every paused or queued job in FIFO order.",
                 reply_markup=kb
             )
 
         if data == "jobs:resume":
+            # Resume ALL recoverable normal jobs, not just the interrupted active job.
+            # Priority:
+            #   1) interrupted active job from before restart
+            #   2) already-persisted FIFO queued jobs
+            #   3) manually paused jobs, ordered by creation time
             candidates = []
-            if normal_active_jid and normal_active_jid in jobs and jobs[normal_active_jid].get("status") == "paused":
-                candidates.append(normal_active_jid)
+
+            if normal_active_jid and normal_active_jid in jobs:
+                active_job = jobs[normal_active_jid]
+                if active_job.get("status") == "paused":
+                    candidates.append(normal_active_jid)
+
             for queued_jid in queue_order:
-                if queued_jid in jobs and jobs[queued_jid].get("status") in {"queued", "paused"}:
-                    candidates.append(queued_jid)
-            if not candidates:
-                candidates = [
-                    jid for jid, j in sorted(jobs.items(), key=lambda item: item[1].get("created", 0))
-                    if jid != "__live__" and j.get("status") == "paused"
-                ]
+                if queued_jid in jobs and queued_jid != "__live__" and jobs[queued_jid].get("status") in {"queued", "paused"}:
+                    if queued_jid not in candidates:
+                        candidates.append(queued_jid)
+
+            paused_extra = [
+                jid for jid, j in sorted(
+                    jobs.items(),
+                    key=lambda item: item[1].get("created", 0)
+                )
+                if jid != "__live__"
+                and j.get("status") == "paused"
+                and jid not in candidates
+            ]
+            candidates.extend(paused_extra)
+
             if not candidates:
                 return await q.answer("No paused/queued jobs to resume.", show_alert=True)
+
+            # Keep the first recoverable job as the active worker and put every
+            # remaining recoverable job into the durable FIFO queue.
             first = candidates[0]
+            new_queue = []
+            for jid in candidates[1:]:
+                if jid in jobs and jobs[jid].get("status") not in {"completed", "cancelled"}:
+                    jobs[jid]["status"] = "queued"
+                    jobs[jid]["stage"] = "Waiting in FIFO queue"
+                    jobs[jid]["cancel_requested"] = False
+                    if jid not in new_queue:
+                        new_queue.append(jid)
+
+            # Preserve any existing queued jobs that were not in candidates.
+            for jid in queue_order:
+                if jid in jobs and jid != first and jobs[jid].get("status") == "queued" and jid not in new_queue:
+                    new_queue.append(jid)
+
+            queue_order[:] = new_queue
+            queued_jobs.clear()
+            queued_jobs.update(new_queue)
+
             jobs[first]["cancel_requested"] = False
+            jobs[first]["stage"] = "Resuming"
+            normal_active_jid = first
             await save()
+
+            # launch() owns the transition to running and will automatically
+            # start the next queued job after completion.
             start_job_task(first, q.message)
-            await q.answer(f"Resuming {first}. Saved queue will continue automatically.")
+            await q.answer(
+                f"Activated {len(candidates)} job(s). Starting {first}; remaining jobs will run automatically in FIFO order."
+            )
             return await q.message.reply_text(progress_text(first), reply_markup=job_kb(first))
 
         if data == "m:stats":
