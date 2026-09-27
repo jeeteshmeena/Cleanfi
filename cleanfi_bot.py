@@ -4,7 +4,7 @@ import shutil
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.enums import ButtonStyle
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, MessageNotModified
 from pyrogram.handlers import RawUpdateHandler, MessageHandler
 from pyrogram.file_id import FileId
 from dotenv import load_dotenv
@@ -828,6 +828,34 @@ async def delay_cmd(_, m):
         jobs[jid]["delay_seconds"] = seconds
         await save()
     await m.reply_text(f"Episode delay set to {seconds} seconds. New jobs will use this delay.")
+
+@app.on_message(filters.private & filters.command("resume"))
+async def resume_cmd(_, m):
+    if not allowed(m):
+        return
+    parts = (m.text or "").split(maxsplit=1)
+    if len(parts) != 2 or parts[1].strip() not in jobs:
+        return await m.reply_text("Usage: /resume JOB_ID")
+    jid = parts[1].strip()
+    if not owned_job(m.from_user.id, jid):
+        return await m.reply_text("This job belongs to another user.")
+    j = jobs[jid]
+    if j.get("status") in {"completed", "completed_with_failures", "cancelled"}:
+        return await m.reply_text(f"Job {jid} is {j.get('status')} and cannot be resumed.", reply_markup=job_kb(jid))
+    if j.get("status") == "running":
+        return await m.reply_text(f"Job {jid} is already running.", reply_markup=job_kb(jid))
+    if j.get("status") == "cancelling":
+        j["cancel_requested"] = False
+    j["stage"] = "Resuming"
+    j["cancel_requested"] = False
+    log.info(
+        "JOB RESUME COMMAND jid=%s status=%s task=%s",
+        jid, j.get("status"), bool(job_tasks.get(jid) and not job_tasks[jid].done())
+    )
+    start_job_task(jid, m)
+    await save()
+    await asyncio.sleep(0)
+    return await m.reply_text(progress_text(jid), reply_markup=job_kb(jid))
 
 @app.on_message(filters.private & filters.command("startpost"))
 async def startpost_cmd(_, m):
@@ -1878,7 +1906,12 @@ async def callback_handler(_, q: CallbackQuery):
 
             if data.startswith("start:"):
                 await q.answer("Starting / resuming...")
-                log.info("JOB RESUME REQUEST jid=%s status=%s task=%s", jid, jobs[jid].get("status"), bool(job_tasks.get(jid) and not job_tasks[jid].done()))
+                log.info(
+                    "JOB RESUME REQUEST jid=%s status=%s task=%s",
+                    jid,
+                    jobs[jid].get("status"),
+                    bool(job_tasks.get(jid) and not job_tasks[jid].done())
+                )
                 try:
                     status = jobs[jid].get("status")
                     if status == "paused":
@@ -1887,11 +1920,23 @@ async def callback_handler(_, q: CallbackQuery):
                     elif status == "queued":
                         jobs[jid]["cancel_requested"] = False
                     start_job_task(jid, q.message)
+                    await save()
                     await asyncio.sleep(0)
-                    return await q.message.edit_text(progress_text(jid), reply_markup=job_kb(jid))
+                    try:
+                        return await q.message.edit_text(progress_text(jid), reply_markup=job_kb(jid))
+                    except MessageNotModified:
+                        log.info("JOB RESUME UI unchanged jid=%s; worker continues", jid)
+                        return None
                 except Exception as e:
                     log.exception("JOB START/RESUME FAILED job=%s", jid)
-                    return await q.message.reply_text(f"Could not start job: {type(e).__name__}: {e}", reply_markup=job_kb(jid))
+                    try:
+                        await q.message.reply_text(
+                            f"Could not start job: {type(e).__name__}: {e}",
+                            reply_markup=job_kb(jid)
+                        )
+                    except Exception:
+                        log.exception("JOB START ERROR MESSAGE FAILED jid=%s", jid)
+                    return None
             if data.startswith("cancel:"):
                 j = jobs[jid]
                 if j.get("status") == "queued":
