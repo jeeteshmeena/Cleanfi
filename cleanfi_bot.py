@@ -229,15 +229,17 @@ async def tg_call(fn, jid=None, label="Telegram"):
                 flood_until = time.time() + seconds
                 if jid and jobs.get(jid):
                     last = jobs[jid].get("last_flood_notice", 0)
-                    if time.time() - last > 30:
+                    if time.time() - last > 60 and label not in {"progress", "send_message"} and seconds < 120:
                         jobs[jid]["last_flood_notice"] = time.time()
-                        try:
-                            asyncio.create_task(app.send_message(
-                                jobs[jid].get("owner", OWNER_ID),
-                                f"Job {jid} is waiting because Telegram returned FloodWait.\\nOperation: {label}\\nWait time: {seconds}s\\nCleanfi will automatically retry the same operation."
-                            ))
-                        except Exception:
-                            log.exception("FLOODWAIT NOTIFICATION FAILED job=%s", jid)
+                        async def _safe_flood_notify(wait_s, op_lbl, j_id):
+                            try:
+                                await app.send_message(
+                                    jobs[j_id].get("owner", OWNER_ID),
+                                    f"Job {j_id} is waiting because Telegram returned FloodWait.\nOperation: {op_lbl}\nWait time: {wait_s}s\nCleanfi will automatically retry."
+                                )
+                            except Exception:
+                                pass
+                        asyncio.create_task(_safe_flood_notify(seconds, label, jid))
                 if jid and jobs.get(jid):
                     jobs[jid]["flood_until"] = flood_until
                     jobs[jid]["flood_label"] = label
@@ -251,7 +253,7 @@ async def resolve_chat(value):
 
 async def safe_progress(jid, force=False):
     j = jobs[jid]; now = time.time()
-    if not force and now - j.get("last_progress", 0) < 2:
+    if not force and now - j.get("last_progress", 0) < 5:
         return
     j["last_progress"] = now
     text = progress_text(jid)
@@ -262,6 +264,8 @@ async def safe_progress(jid, force=False):
             msg = await tg_call(lambda: app.send_message(j["owner"], text), jid, "progress")
             j["progress_message_id"] = msg.id
         await save()
+    except MessageNotModified:
+        pass
     except Exception as e:
         print(f"Progress update failed: {type(e).__name__}: {e}")
 
@@ -697,7 +701,7 @@ async def create_job(owner, start, end):
     return jid
 
 async def raw_update(_, update, users, chats):
-    log.info("RAW TELEGRAM UPDATE: %s", type(update).__name__)
+    log.debug("RAW TELEGRAM UPDATE: %s", type(update).__name__)
 
 app.add_handler(RawUpdateHandler(raw_update), group=-1000)
 
@@ -855,7 +859,11 @@ async def resume_cmd(_, m):
     start_job_task(jid, m)
     await save()
     await asyncio.sleep(0)
-    return await m.reply_text(progress_text(jid), reply_markup=job_kb(jid))
+    try:
+        return await m.reply_text(progress_text(jid), reply_markup=job_kb(jid))
+    except FloodWait as e:
+        log.warning("Cannot send reply to /resume: FloodWait (%ss)", getattr(e, "value", 0))
+        return None
 
 @app.on_message(filters.private & filters.command("startpost"))
 async def startpost_cmd(_, m):
@@ -1781,8 +1789,11 @@ async def callback_handler(_, q: CallbackQuery):
             return await q.message.reply_text("Live Metadata", reply_markup=live_meta_kb())
 
         if data == "live:refresh":
-            await q.answer()
-            return await q.message.edit_text(live_text(), reply_markup=live_kb())
+            try:
+                await q.message.edit_text(live_text(), reply_markup=live_kb())
+                return await q.answer("Refreshed")
+            except MessageNotModified:
+                return await q.answer("Already up to date")
 
         if data == "live:back":
             await q.answer()
@@ -1952,8 +1963,11 @@ async def callback_handler(_, q: CallbackQuery):
                 await save()
                 return await q.answer("Cancellation requested")
             if data.startswith("refresh:"):
-                await q.answer()
-                return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
+                try:
+                    await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
+                    return await q.answer("Refreshed")
+                except MessageNotModified:
+                    return await q.answer("Already up to date")
             if data.startswith("genre:"):
                 await q.answer()
                 return await q.message.reply_text(
@@ -1970,7 +1984,10 @@ async def callback_handler(_, q: CallbackQuery):
                 sessions.pop((q.from_user.id, "field"), None)
                 await save()
                 await q.answer("Genre saved")
-                return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
+                try:
+                    return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
+                except MessageNotModified:
+                    return None
             if data.startswith("genrecustom:"):
                 sessions[q.from_user.id] = jid
                 sessions[(q.from_user.id, "field")] = "genre"
@@ -1984,7 +2001,10 @@ async def callback_handler(_, q: CallbackQuery):
             if data.startswith("genrecancel:"):
                 sessions.pop((q.from_user.id, "field"), None)
                 await q.answer("Cancelled")
-                return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
+                try:
+                    return await q.message.edit_text(summary(jid), reply_markup=job_kb(jid))
+                except MessageNotModified:
+                    return None
             if data.startswith("startpost:"):
                 sessions[q.from_user.id] = jid
                 sessions[(q.from_user.id, "startpost")] = True
@@ -1992,6 +2012,12 @@ async def callback_handler(_, q: CallbackQuery):
                 return await q.message.reply_text("Send the Start Post image with its caption.")
 
         return await q.answer("Unknown button", show_alert=True)
+    except MessageNotModified:
+        try:
+            await q.answer("Already up to date")
+        except Exception:
+            pass
+        return None
     except Exception as e:
         log.exception("INLINE CALLBACK FAILED")
         try:
